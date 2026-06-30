@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import config as cfg
 from . import supabase_client as sb
-from .engine1_generator import batch as gen_batch, scrape_lists, set_biased_ports, set_biased_subnets, set_working_ips, reset_port_cycle
+from .engine1_generator import batch as gen_batch, scrape_lists, set_biased_ports, set_biased_subnets, set_working_ips
 from .engine2_tester import worker as e2_worker, best_ports
 from .engine3_verifier import verify as e3_verify, cleanup_subprocesses as e3_cleanup
 
@@ -28,6 +28,7 @@ stats = dict(generated=0, tested=0, open_port=0, http_ok=0,
              residential=0, verified=0, saved_e2=0, qdepth=0)
 db_totals = dict(total=0, e2_ok=0, vplink_ok=0, residential=0)
 runners = []
+_restart_flag = False
 def render():
     os.system("clear" if os.name == "posix" else "cls")
     e = time.time() - render.t0
@@ -192,6 +193,7 @@ async def main_loop(args):
         pass
 
     render.t0 = time.time()
+    stats["_stall_restart_at"] = time.time()
 
     q = asyncio.Queue(maxsize=15000)
     e2_results = deque()
@@ -273,6 +275,12 @@ async def main_loop(args):
                 if now - stats.get("_stall_warned", 0) > 30:
                     stats["_stall_warned"] = now
                     sys.stderr.write(f"[stall] no tests in 30s — queue={q.qsize()} known_ips={len(known_ips)}\n")
+                if now - stats.get("_stall_restart_at", 0) > 60:
+                    sys.stderr.write("[stall] 60s — auto-restarting\n")
+                    _restart_flag = True
+                    break
+            else:
+                stats["_stall_restart_at"] = now
             stats["_last_tested"] = stats["tested"]
             if now - last_port_rebalance > 60:
                 last_port_rebalance = now
@@ -297,16 +305,9 @@ async def main_loop(args):
                 e3_verified_event.clear()
                 run_verified += 1
             if run_verified >= SESSION_RESTART_AFTER:
-                sys.stderr.write(f"[restart] {run_verified} verified — session reset (workers stay up)\n")
-                run_verified = 0
-                for k in ("generated", "tested", "http_ok", "saved_e2", "verified", "residential"):
-                    stats[k] = 0
-                runners.clear()
-                e3_tracking["enqueued"] = 0
-                e3_tracking["completed"] = 0
-                reset_port_cycle()
-                render.t0 = time.time()
-                continue
+                sys.stderr.write(f"[restart] {run_verified} verified — clean restart\n")
+                _restart_flag = True
+                break
 
             if args.once:
                 all_e2_done = q.qsize() == 0 and not e2_results
@@ -413,10 +414,21 @@ def cmd_delete(args):
 
 
 def _run(args):
-    try:
-        asyncio.run(main_loop(args))
-    except KeyboardInterrupt:
-        pass
+    global _restart_flag
+    while True:
+        _restart_flag = False
+        try:
+            asyncio.run(main_loop(args))
+        except KeyboardInterrupt:
+            break
+        except Exception as exc:
+            sys.stderr.write(f"[!] Crash: {exc}. Restarting in 3s...\n")
+            time.sleep(3)
+            continue
+        if _restart_flag:
+            sys.stderr.write("[restart] starting new session\n")
+            continue
+        break
 
 
 def main():
