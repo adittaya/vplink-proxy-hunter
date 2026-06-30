@@ -54,14 +54,10 @@ RES_FIRST_OCTETS = [
 
 _biased_subnets: set[str] | None = None
 _biased_subnet_pool: list[tuple[int, int, int, int]] | None = None
+_working_ips: list[str] = []
 
 
 def set_biased_subnets(subnets: set[str]):
-    """Bias IP generation toward /16 subnets that produced working proxies.
-    
-    Call this with a set of 'A.B' subnet strings from successful E2 results.
-    When a subnet pool is set, 70% of generated IPs come from these subnets,
-    30% from the usual residential-weighted random space."""
     global _biased_subnets, _biased_subnet_pool
     _biased_subnets = subnets
     _biased_subnet_pool = None
@@ -77,6 +73,11 @@ def set_biased_subnets(subnets: set[str]):
                 except ValueError:
                     pass
         _biased_subnet_pool = pool if pool else None
+
+
+def set_working_ips(ips: list[str]):
+    global _working_ips
+    _working_ips = ips
 
 
 BLOCKED_SUBNETS = [
@@ -138,8 +139,13 @@ def _blocked_ip(ip: str) -> bool:
 
 def generate_ip() -> str:
     while True:
-        # 70% from known working /16 subnets when pool exists, else random residential
-        if _biased_subnet_pool and random.random() < 0.7:
+        # 60% from exact known-working IPs (try different ports/siblings)
+        if _working_ips and random.random() < 0.6:
+            ip = random.choice(_working_ips)
+            if not _blocked_ip(ip):
+                return ip
+        # 30% from known /16 subnets
+        if _biased_subnet_pool and random.random() < 0.3:
             a, b, _, _ = random.choice(_biased_subnet_pool)
         else:
             a = random.choice(RES_FIRST_OCTETS)

@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import config as cfg
 from . import supabase_client as sb
-from .engine1_generator import batch as gen_batch, scrape_lists, set_biased_ports, set_biased_subnets
+from .engine1_generator import batch as gen_batch, scrape_lists, set_biased_ports, set_biased_subnets, set_working_ips
 from .engine2_tester import worker as e2_worker, best_ports
 from .engine3_verifier import verify as e3_verify, cleanup_subprocesses as e3_cleanup
 
@@ -174,12 +174,12 @@ async def main_loop(args):
     SESSION_RESTART_AFTER = 20
     run_verified = 0
 
-    # Bootstrap /16 subnets from DB — start biased toward proven ranges
+    # Bootstrap exact working IPs from DB
     try:
-        known_subnets = await sb.async_get_subnets()
-        if known_subnets:
-            set_biased_subnets(known_subnets)
-            sys.stderr.write(f"[boot] loaded {len(known_subnets)} /16 subnets from DB\n")
+        known_ips = sb.get_working_ips()
+        if known_ips:
+            set_working_ips(known_ips)
+            sys.stderr.write(f"[boot] loaded {len(known_ips)} working IPs from DB\n")
     except Exception:
         pass
 
@@ -199,7 +199,7 @@ async def main_loop(args):
     e2_event = asyncio.Event()
     e3_tracking = {"enqueued": 0, "completed": 0}
     e3_verified_event = asyncio.Event()
-    known_subnets: set[str] = set()
+    known_ips: list[str] = []
 
     e2_pool = [asyncio.create_task(e2_worker(q, e2_results, e2_event))
                for _ in range(80)]
@@ -259,10 +259,9 @@ async def main_loop(args):
                 }
                 await sb.async_upsert_proxy(e2_entry)
                 stats["saved_e2"] += 1
-                # Track /16 subnet for generator bias
-                ip_parts = cand["ip"].split(".")
-                if len(ip_parts) >= 2:
-                    known_subnets.add(f"{ip_parts[0]}.{ip_parts[1]}")
+                # Track exact IP for generator bias
+                if cand["ip"] not in known_ips:
+                    known_ips.append(cand["ip"])
                 e3_tracking["enqueued"] += 1
                 e3_queue.put_nowait(cand)
 
@@ -272,8 +271,12 @@ async def main_loop(args):
                 good = best_ports(20)
                 if good:
                     set_biased_ports(good)
-                if known_subnets:
-                    set_biased_subnets(known_subnets)
+                set_working_ips(known_ips)
+                if known_ips:
+                    if len(known_ips) >= 3:
+                        # Also add /16 subnets from clustered IPs for exploration
+                        subnets = {f"{ip.split('.')[0]}.{ip.split('.')[1]}" for ip in known_ips}
+                        set_biased_subnets(subnets)
 
             if e3_verified_event.is_set():
                 e3_verified_event.clear()

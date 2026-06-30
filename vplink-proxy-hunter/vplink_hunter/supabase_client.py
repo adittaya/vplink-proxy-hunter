@@ -182,6 +182,24 @@ def get_successful_subnets() -> set[str]:
         return set()
 
 
+def get_working_ips() -> list[str]:
+    """Return list of exact IPs that passed E2 (no duplicates)."""
+    if not _client:
+        return []
+    try:
+        resp = _client.table("proxy_results").select("ip").eq("e2_ok", True).execute()
+        seen: set[str] = set()
+        ips: list[str] = []
+        for row in resp.data:
+            ip = row["ip"]
+            if ip not in seen:
+                seen.add(ip)
+                ips.append(ip)
+        return ips
+    except Exception:
+        return []
+
+
 async def async_get_subnets() -> set[str]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, get_successful_subnets)
