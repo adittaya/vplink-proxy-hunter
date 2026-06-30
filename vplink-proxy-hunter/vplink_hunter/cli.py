@@ -17,7 +17,7 @@ from . import config as cfg
 from . import supabase_client as sb
 from .engine1_generator import batch as gen_batch, scrape_lists, set_biased_ports, set_biased_subnets
 from .engine2_tester import worker as e2_worker, best_ports
-from .engine3_verifier import verify as e3_verify
+from .engine3_verifier import verify as e3_verify, cleanup_subprocesses as e3_cleanup
 
 
 def c(s, code=0):
@@ -120,14 +120,14 @@ async def e3_worker(e3_queue, stats, runners, e3_tracking, verified_event=None):
 
 
 async def gen_worker(q, stats):
-    """Generate steady batches, never stall."""
+    """Generate steadily, stop when queue is deep enough."""
     while True:
         depth = q.qsize()
         stats["qdepth"] = depth
-        if depth >= 10000:
-            await asyncio.sleep(0.3)
+        if depth >= 2000:
+            await asyncio.sleep(0.5)
             continue
-        batch = gen_batch(200)
+        batch = gen_batch(150)
         stats["generated"] += len(batch)
         for ip, port in batch:
             await q.put((ip, port))
@@ -300,6 +300,7 @@ async def main_loop(args):
             cleanup_task.cancel()
         if db_stats_task_handle:
             db_stats_task_handle.cancel()
+        e3_cleanup()
         for w in e2_pool + e3_pool:
             w.cancel()
         tasks_to_gather = [render_task, *e2_pool, *e3_pool]

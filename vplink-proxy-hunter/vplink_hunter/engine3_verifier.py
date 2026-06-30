@@ -5,7 +5,11 @@ Avoids httpx proxy configuration incompatibilities across versions."""
 
 import asyncio
 import re
+import signal
 import subprocess
+
+# Track running curl processes so we can kill them on shutdown
+_curl_procs: set[asyncio.subprocess.Process] = set()
 
 DATACENTER_ORGS = re.compile(
     r"alibaba|amazon|google|hetzner|ovh|digitalocean|vultr|"
@@ -29,6 +33,17 @@ DATACENTER_ORGS = re.compile(
     r"cyxtera|vapor.?io|iron.?mountain"
 )
 
+def cleanup_subprocesses():
+    """Kill any leftover curl processes (call before event loop closes)."""
+    for proc in list(_curl_procs):
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    _curl_procs.clear()
+
+
 VPLINK_TEST_URL = "https://vplink.in/UbpV2D"
 VPN_DETECTED_PATTERNS = re.compile(
     r"vpn\s*detected|proxy\s*detected|access\s*denied|blocked|"
@@ -48,16 +63,27 @@ async def _curl_get(url: str, proxy: str, timeout: int = 12) -> str | None:
         "-x", proxy,
         url,
     ]
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
+        _curl_procs.add(proc)
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 2)
         if proc.returncode != 0 or not out:
             return None
         return out.decode(errors="replace")
     except Exception:
         return None
+    finally:
+        if proc:
+            _curl_procs.discard(proc)
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
 
 
 async def check_vplink(ip: str, port: int, timeout: float = 10.0) -> dict:
