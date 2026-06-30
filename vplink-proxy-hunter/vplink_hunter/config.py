@@ -6,14 +6,37 @@ CONFIG_DIR = os.path.expanduser("~/.config/vplink-hunter")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 
+def _load_dotenv(path=".env"):
+    if not os.path.exists(path):
+        return {}
+    env = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            env[key.strip()] = val.strip().strip("\"'")
+    return env
+
+
 def load():
-    if not os.path.exists(CONFIG_PATH):
-        return None
-    try:
-        with open(CONFIG_PATH) as f:
-            return json.load(f)
-    except Exception:
-        return None
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    dotenv = _load_dotenv()
+    if dotenv:
+        return {
+            "supabase_url": dotenv.get("SUPABASE_URL", ""),
+            "anon_key": dotenv.get("SUPABASE_ANON_KEY", ""),
+            "service_key": dotenv.get("SUPABASE_SERVICE_KEY", ""),
+        }
+
+    return None
 
 
 def save(data: dict):
