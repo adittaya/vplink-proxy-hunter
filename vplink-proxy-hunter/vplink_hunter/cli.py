@@ -260,10 +260,11 @@ async def main_loop(args):
                 }
                 await sb.async_upsert_proxy(e2_entry)
                 stats["saved_e2"] += 1
-                # Track exact IP for generator bias
-                if cand["ip"] not in known_ips:
-                    known_ips.append(cand["ip"])
-                ip_last_hit[cand["ip"]] = time.time()
+                # Track exact IP for generator bias (skip datacenter)
+                if existing_type != "datacenter":
+                    if cand["ip"] not in known_ips:
+                        known_ips.append(cand["ip"])
+                    ip_last_hit[cand["ip"]] = time.time()
                 e3_tracking["enqueued"] += 1
                 e3_queue.put_nowait(cand)
 
@@ -278,9 +279,13 @@ async def main_loop(args):
                 good = best_ports(20)
                 if good:
                     set_biased_ports(good)
-                # Prune known IPs with no hit in 10 min
+                # Prune known IPs with no hit in 10 min or DC-classified
                 stale_cutoff = now - 600
-                known_ips = [ip for ip in known_ips if ip_last_hit.get(ip, 0) >= stale_cutoff]
+                prune_ips = sb.get_dc_ips()
+                known_ips = [ip for ip in known_ips
+                             if ip not in prune_ips and ip_last_hit.get(ip, 0) >= stale_cutoff]
+                if prune_ips:
+                    sys.stderr.write(f"[prune] removed {len(prune_ips)} DC IPs from gen pool\n")
                 set_working_ips(known_ips)
                 if known_ips:
                     if len(known_ips) >= 3:

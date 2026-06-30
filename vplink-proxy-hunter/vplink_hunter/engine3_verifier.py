@@ -30,7 +30,8 @@ DATACENTER_ORGS = re.compile(
     r"fastcomet|chemicloud|tmdhosting|verpex|servers\.com|"
     r"phoenixnap|hivelocity|hostwinds|hostpapa|"
     r"coreweave|equinix|digital.?realty|flexential|"
-    r"cyxtera|vapor.?io|iron.?mountain"
+    r"cyxtera|vapor.?io|iron.?mountain|"
+    r"routerhosting"
 )
 
 def cleanup_subprocesses():

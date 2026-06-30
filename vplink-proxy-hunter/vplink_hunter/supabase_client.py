@@ -200,6 +200,17 @@ def get_working_ips() -> list[str]:
         return []
 
 
+def get_dc_ips() -> set[str]:
+    """Return set of IPs classified as datacenter."""
+    if not _client:
+        return set()
+    try:
+        resp = _client.table("proxy_results").select("ip").eq("type", "datacenter").execute()
+        return {row["ip"] for row in (resp.data or [])}
+    except Exception:
+        return set()
+
+
 async def async_get_subnets() -> set[str]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, get_successful_subnets)
