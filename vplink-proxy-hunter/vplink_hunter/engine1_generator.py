@@ -157,13 +157,28 @@ def generate_ip() -> str:
             return ip
 
 
-def generate_port():
+_known_ip_port_idx: dict[str, int] = {}
+
+
+def generate_port(ip: str = "") -> int:
+    """Cycle ports in order for known IPs, random for unknown."""
     ports = _biased_ports if _biased_ports else PROXY_PORTS
+    if ip in _working_ips:
+        idx = _known_ip_port_idx.get(ip, 0)
+        _known_ip_port_idx[ip] = (idx + 1) % len(ports)
+        return ports[idx]
     return random.choice(ports)
 
 
 def generate() -> tuple:
-    return generate_ip(), generate_port()
+    ip = generate_ip()
+    port = generate_port(ip)
+    return ip, port
+
+
+def reset_port_cycle():
+    global _known_ip_port_idx
+    _known_ip_port_idx = {}
 
 
 def batch(count: int = 2000) -> list:

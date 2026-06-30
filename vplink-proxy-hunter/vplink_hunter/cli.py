@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import config as cfg
 from . import supabase_client as sb
-from .engine1_generator import batch as gen_batch, scrape_lists, set_biased_ports, set_biased_subnets, set_working_ips
+from .engine1_generator import batch as gen_batch, scrape_lists, set_biased_ports, set_biased_subnets, set_working_ips, reset_port_cycle
 from .engine2_tester import worker as e2_worker, best_ports
 from .engine3_verifier import verify as e3_verify, cleanup_subprocesses as e3_cleanup
 
@@ -200,6 +200,7 @@ async def main_loop(args):
     e3_tracking = {"enqueued": 0, "completed": 0}
     e3_verified_event = asyncio.Event()
     known_ips: list[str] = []
+    ip_last_hit: dict[str, float] = {}
 
     e2_pool = [asyncio.create_task(e2_worker(q, e2_results, e2_event))
                for _ in range(80)]
@@ -262,15 +263,24 @@ async def main_loop(args):
                 # Track exact IP for generator bias
                 if cand["ip"] not in known_ips:
                     known_ips.append(cand["ip"])
+                ip_last_hit[cand["ip"]] = time.time()
                 e3_tracking["enqueued"] += 1
                 e3_queue.put_nowait(cand)
 
             now = time.time()
+            if stats["tested"] == stats.get("_last_tested", 0) and stats["tested"] > 0:
+                if now - stats.get("_stall_warned", 0) > 30:
+                    stats["_stall_warned"] = now
+                    sys.stderr.write(f"[stall] no tests in 30s — queue={q.qsize()} known_ips={len(known_ips)}\n")
+            stats["_last_tested"] = stats["tested"]
             if now - last_port_rebalance > 60:
                 last_port_rebalance = now
                 good = best_ports(20)
                 if good:
                     set_biased_ports(good)
+                # Prune known IPs with no hit in 10 min
+                stale_cutoff = now - 600
+                known_ips = [ip for ip in known_ips if ip_last_hit.get(ip, 0) >= stale_cutoff]
                 set_working_ips(known_ips)
                 if known_ips:
                     if len(known_ips) >= 3:
@@ -289,6 +299,7 @@ async def main_loop(args):
                 runners.clear()
                 e3_tracking["enqueued"] = 0
                 e3_tracking["completed"] = 0
+                reset_port_cycle()
                 render.t0 = time.time()
                 continue
 
