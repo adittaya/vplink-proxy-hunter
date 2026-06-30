@@ -28,7 +28,6 @@ stats = dict(generated=0, tested=0, open_port=0, http_ok=0,
              residential=0, verified=0, saved_e2=0, qdepth=0)
 db_totals = dict(total=0, e2_ok=0, vplink_ok=0, residential=0)
 runners = []
-_restart_flag = False
 def render():
     os.system("clear" if os.name == "posix" else "cls")
     e = time.time() - render.t0
@@ -167,10 +166,12 @@ async def stale_cleanup_task(interval: int = 300):
         await asyncio.sleep(interval)
 
 
-async def main_loop(args):
+async def main_loop(args) -> bool:
+    """Run one session. Returns True if caller should restart."""
     conf = cfg.get()
     sb.init(conf["supabase_url"], conf["service_key"])
 
+    should_restart = False
     SESSION_RESTART_AFTER = 20
     stats["verified"] = 0
 
@@ -229,7 +230,7 @@ async def main_loop(args):
         while True:
             stats["qdepth"] = q.qsize()
 
-            if _restart_flag:
+            if should_restart:
                 break
 
             # Timeout on event wait — prevents deadlock when all proxies fail
@@ -239,7 +240,7 @@ async def main_loop(args):
                 pass
             e2_event.clear()
 
-            if _restart_flag:
+            if should_restart:
                 break
 
             while e2_results:
@@ -281,10 +282,10 @@ async def main_loop(args):
                 if e3_verified_event.is_set():
                     e3_verified_event.clear()
                     sys.stderr.write(f"[restart] {stats['verified']} verified — clean restart\n")
-                    _restart_flag = True
+                    should_restart = True
                     break
 
-            if _restart_flag:
+            if should_restart:
                 break
 
             now = time.time()
@@ -294,7 +295,7 @@ async def main_loop(args):
                     sys.stderr.write(f"[stall] no tests in 30s — queue={q.qsize()} known_ips={len(known_ips)}\n")
                 if now - stats.get("_stall_restart_at", 0) > 60:
                     sys.stderr.write("[stall] 60s — auto-restarting\n")
-                    _restart_flag = True
+                    should_restart = True
                     break
             else:
                 stats["_stall_restart_at"] = now
@@ -321,7 +322,7 @@ async def main_loop(args):
             if e3_verified_event.is_set():
                 e3_verified_event.clear()
                 sys.stderr.write(f"[restart] {stats['verified']} verified — clean restart\n")
-                _restart_flag = True
+                should_restart = True
 
             if args.once:
                 all_e2_done = q.qsize() == 0 and not e2_results
@@ -353,6 +354,7 @@ async def main_loop(args):
         await asyncio.gather(*tasks_to_gather, return_exceptions=True)
 
     render()
+    return should_restart
 
 
 async def _render_loop():
@@ -428,18 +430,16 @@ def cmd_delete(args):
 
 
 def _run(args):
-    global _restart_flag
     while True:
-        _restart_flag = False
         try:
-            asyncio.run(main_loop(args))
+            should = asyncio.run(main_loop(args))
         except KeyboardInterrupt:
             break
         except Exception as exc:
             sys.stderr.write(f"[!] Crash: {exc}. Restarting in 3s...\n")
             time.sleep(3)
             continue
-        if _restart_flag:
+        if should:
             sys.stderr.write("[restart] starting new session\n")
             continue
         break
