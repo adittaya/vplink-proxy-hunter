@@ -1,7 +1,7 @@
 """Engine 3 — VPLINK Verifier + Residential Detector.
 
-httpx async client replaces curl subprocess.
-Proper timeout handling, crash-resistant, no fork overhead."""
+httpx async through proxy (singular kwarg for 0.28+).
+Proper timeout handling, crash-resistant, no subprocess overhead."""
 
 import asyncio
 import re
@@ -35,7 +35,7 @@ async def check_vplink(ip: str, port: int, timeout: float = 10.0) -> dict:
 
     try:
         async with httpx.AsyncClient(
-            proxies={"http://": proxy_url, "https://": proxy_url},
+            proxy=proxy_url,
             timeout=httpx.Timeout(timeout, connect=5.0),
             follow_redirects=True,
         ) as client:
