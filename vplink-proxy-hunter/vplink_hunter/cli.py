@@ -120,29 +120,18 @@ async def e3_worker(e3_queue, stats, runners, e3_tracking, verified_event=None):
 
 
 async def gen_worker(q, stats):
-    """Generate small batches, adapt to E2 drain rate."""
-    min_batch = 50
-    max_batch = 300
-    current_batch = 100
-    last_depth = 0
+    """Generate steady batches, never stall."""
     while True:
         depth = q.qsize()
         stats["qdepth"] = depth
-        # Adapt batch size: if queue growing, shrink; if draining, grow
-        if depth > last_depth + 10:
-            current_batch = max(min_batch, current_batch - 20)
-        elif depth < last_depth - 50:
-            current_batch = min(max_batch, current_batch + 20)
-        last_depth = depth
-
-        if depth >= 2000:
-            await asyncio.sleep(0.5)
+        if depth >= 10000:
+            await asyncio.sleep(0.3)
             continue
-        batch = gen_batch(current_batch)
+        batch = gen_batch(200)
         stats["generated"] += len(batch)
         for ip, port in batch:
-            await q.put_nowait((ip, port))
-        await asyncio.sleep(max(0.05, depth / 2000))
+            await q.put((ip, port))
+        await asyncio.sleep(0.05)
 
 
 async def db_stats_task(interval: int = 10):

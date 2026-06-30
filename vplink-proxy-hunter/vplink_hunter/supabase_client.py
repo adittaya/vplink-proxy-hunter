@@ -48,7 +48,7 @@ def upsert_proxy(proxy: dict, retries: int = 3):
         try:
             _client.table("proxy_results").upsert(
                 row,
-                on_conflict="ip",
+                on_conflict="ip,port",
             ).execute()
             return
         except Exception as e:
