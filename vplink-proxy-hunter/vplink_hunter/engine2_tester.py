@@ -1,42 +1,81 @@
 """Engine 2 — Rapid Fire Tester.
 
-Single-step TCP+HTTP via httpx async client.
-No subprocess overhead, aggressive timeouts, crash-resistant workers."""
+Raw asyncio socket HTTP through proxy.
+No subprocess, no httpx dependency — pure async IO with full control."""
 
 import asyncio
+import json
 import time
 from collections import defaultdict
-
-import httpx
 
 port_hits = defaultdict(int)
 port_tries = defaultdict(int)
 
+_HTTP_GET_TPL = (
+    "GET http://ipinfo.io/json HTTP/1.1\r\n"
+    "Host: ipinfo.io\r\n"
+    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
+    "Accept: application/json\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+)
 
-async def test_one(ip: str, port: int, timeout: float = 8.0) -> dict | None:
+
+async def test_one(ip: str, port: int) -> dict | None:
     t0 = time.time()
     port_tries[port] += 1
-    proxy_url = f"http://{ip}:{port}"
 
+    reader = writer = None
     try:
-        async with httpx.AsyncClient(
-            proxies={"http://": proxy_url, "https://": proxy_url},
-            timeout=httpx.Timeout(timeout, connect=3.0),
-            follow_redirects=True,
-        ) as client:
-            resp = await client.get("http://ipinfo.io/json")
-            if resp.status_code != 200:
-                return None
-            data = resp.json()
-    except httpx.ConnectError:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=2.5
+        )
+    except asyncio.TimeoutError:
         return None
-    except httpx.ConnectTimeout:
-        return None
-    except httpx.ReadTimeout:
-        return None
-    except httpx.ProxyError:
+    except OSError:
         return None
     except Exception:
+        return None
+
+    try:
+        writer.write(_HTTP_GET_TPL.encode())
+        await asyncio.wait_for(writer.drain(), timeout=2)
+
+        response = b""
+        deadline = time.time() + 5.5
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            chunk = await asyncio.wait_for(
+                reader.read(4096), timeout=min(remaining, 2)
+            )
+            if not chunk:
+                break
+            response += chunk
+    except asyncio.TimeoutError:
+        writer.close()
+        return None
+    except Exception:
+        writer.close()
+        return None
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    try:
+        header_end = response.index(b"\r\n\r\n")
+        headers_raw = response[:header_end].decode(errors="replace")
+        body = response[header_end + 4:]
+
+        status_line = headers_raw.split("\r\n")[0] if headers_raw else ""
+        if "200" not in status_line:
+            return None
+
+        data = json.loads(body.decode(errors="replace"))
+    except (ValueError, json.JSONDecodeError, IndexError):
         return None
 
     latency = round((time.time() - t0) * 1000)
@@ -66,7 +105,7 @@ def best_ports(n: int = 10) -> list[int]:
 
 
 async def worker(q: asyncio.Queue, results: list, ready_event: asyncio.Event):
-    """Consume IP:port from queue, test via httpx, append result."""
+    """Consume IP:port from queue, test via raw socket, append result."""
     while True:
         got_item = False
         try:
