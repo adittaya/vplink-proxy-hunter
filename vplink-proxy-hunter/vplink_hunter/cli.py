@@ -21,7 +21,7 @@ def c(s, code=0):
     return f"\033[{code}m{s}\033[0m"
 
 
-stats = dict(generated=0, tested=0, open_port=0, http_ok=0, residential=0, verified=0, saved_e2=0)
+stats = dict(generated=0, tested=0, open_port=0, http_ok=0, residential=0, verified=0, saved_e2=0, qdepth=0)
 runners = []
 
 
@@ -29,6 +29,7 @@ def render():
     os.system("clear" if os.name == "posix" else "cls")
     e = time.time() - render.t0
     r = int(stats["tested"] / max(e, 1))
+    qd = stats["qdepth"]
 
     sys.stdout.write(c("╔" + "═" * 68 + "╗\n", 36))
     sys.stdout.write(c("""║  ██╗   ██╗██████╗ ██╗     ██╗███╗   ██╗██╗  ██╗    ██╗  ██╗██╗   ║
@@ -38,28 +39,26 @@ def render():
 ║   ╚████╔╝ ██║     ███████╗██║██║ ╚████║     ██║    ██║  ██║██║   ║
 ║    ╚═══╝  ╚═╝     ╚══════╝╚═╝╚═╝  ╚═══╝     ╚═╝    ╚═╝  ╚═╝╚═╝   ║""", 93))
     sys.stdout.write(c("╚" + "═" * 68 + "╝\n", 36))
-    sys.stdout.write(c(f"  ⚡ {r}/s  ⏱ {int(e)}s  🧬 {stats['generated']} gen\n", 90))
 
-    bar_w = 42
-    tot = max(stats["generated"], 1)
-    pct = stats["tested"] / tot
-    fill = int(bar_w * min(pct, 1))
-    bar = c("█" * fill, 92) + c("░" * (bar_w - fill), 90)
-    sys.stdout.write(f"  [{bar}] {stats['tested']}/{tot}\n")
+    # Throughput line: rate, elapsed, queue depth
+    qbar_w = 30
+    qfill = int(qbar_w * min(qd / 5000, 1))
+    qbar = c("█" * qfill, 93) + c("░" * (qbar_w - qfill), 90)
+    sys.stdout.write(c(f"  ⚡ {r}/s  ⏱ {int(e)}s  📥 queue [{qbar}] {qd}\n", 90))
 
     sys.stdout.write(c("╔" + "═" * 68 + "╗\n", 36))
     rows = [
-        ("🧬  E1 GEN", stats["generated"]),
-        ("🎯  E2 TEST", stats["tested"]),
-        ("🔓  PORT", stats["open_port"]),
+        ("🧬  GEN", stats["generated"]),
+        ("🎯  TEST", stats["tested"]),
         ("🌐  HTTP", stats["http_ok"]),
-        ("💾  E2 SAVED", stats["saved_e2"]),
-        ("✅  E3 VRFYD", stats["verified"]),
+        ("💾  SAVED", stats["saved_e2"]),
+        ("✅  VRFYD", stats["verified"]),
+        ("📥  QUEUE", stats["qdepth"]),
     ]
     for i in range(0, 6, 2):
         l_name, l_val = rows[i]
         r_name, r_val = rows[i + 1]
-        sys.stdout.write(c(f"║  {l_name:<10} {c(str(l_val),97):<14}  {r_name:<10} {c(str(r_val),97):<14}║\n", 90))
+        sys.stdout.write(c(f"║  {l_name:<7} {c(str(l_val),97):<10}  {r_name:<7} {c(str(r_val),97):<10}║\n", 90))
     sys.stdout.write(c("╚" + "═" * 68 + "╝\n", 36))
 
     if stats["verified"] > 0:
@@ -99,12 +98,19 @@ async def e3_worker(e3_queue, max_e3, stats, runners):
 
 
 async def gen_worker(q):
-    """Background: continuously generates IP:port batches into the queue."""
+    """Background: generates IP:port batches, throttled by queue depth."""
     while True:
-        batch = gen_batch(2000)
+        depth = q.qsize()
+        stats["qdepth"] = depth
+        # Don't generate if queue already has enough work
+        if depth > 3000:
+            await asyncio.sleep(0.5)
+            continue
+        batch = gen_batch(400)
         stats["generated"] += len(batch)
         for ip, port in batch:
             await q.put((ip, port))
+        await asyncio.sleep(0.05)
 
 
 async def main_loop(args):
