@@ -120,18 +120,20 @@ async def e3_worker(e3_queue, stats, runners, e3_tracking, verified_event=None):
 
 
 async def gen_worker(q, stats):
-    """Generate steadily, stop when queue is deep enough."""
+    """Match E2 throughput — target 500 in queue, small steady batches."""
+    TARGET = 500
     while True:
         depth = q.qsize()
         stats["qdepth"] = depth
-        if depth >= 2000:
-            await asyncio.sleep(0.5)
+        gap = TARGET - depth
+        if gap <= 0:
+            await asyncio.sleep(0.2)
             continue
-        batch = gen_batch(150)
+        batch = gen_batch(min(gap, 50))
         stats["generated"] += len(batch)
         for ip, port in batch:
             await q.put((ip, port))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)
 
 
 async def db_stats_task(interval: int = 10):
@@ -219,7 +221,7 @@ async def main_loop(args):
 
         gen_task = asyncio.create_task(gen_worker(q, stats))
         cleanup_task = asyncio.create_task(stale_cleanup_task())
-        db_stats_task_handle = asyncio.create_task(db_stats_task(interval=30))
+        db_stats_task_handle = asyncio.create_task(db_stats_task(interval=10))
 
         last_port_rebalance = time.time()
 
