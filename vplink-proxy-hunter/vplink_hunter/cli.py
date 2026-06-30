@@ -215,17 +215,23 @@ async def main_loop(args):
                 if not cand:
                     continue
                 stats["http_ok"] += 1
+
+                # Preserve existing vplink_ok/type from DB — don't erase E3 results
+                existing = sb.get_proxy(cand["ip"], cand["port"])
+                existing_vplink = existing.get("vplink_ok", False) if existing else False
+                existing_type = existing.get("type", "unknown") if existing else "unknown"
+
                 e2_entry = {
                     "ip": cand["ip"],
                     "port": cand["port"],
                     "proto": "http",
                     "latency": cand["latency"],
-                    "type": "unknown",
+                    "type": existing_type,
                     "isp": cand.get("isp", ""),
                     "country": cand.get("country", ""),
                     "city": cand.get("city", ""),
                     "region": cand.get("region", ""),
-                    "vplink_ok": False,
+                    "vplink_ok": existing_vplink,
                     "e2_ok": True,
                 }
                 sb.upsert_proxy(e2_entry)
