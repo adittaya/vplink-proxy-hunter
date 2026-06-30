@@ -68,8 +68,10 @@ def best_ports(n: int = 10) -> list[int]:
 async def worker(q: asyncio.Queue, results: list, ready_event: asyncio.Event):
     """Consume IP:port from queue, test via httpx, append result."""
     while True:
+        got_item = False
         try:
             ip, port = await asyncio.wait_for(q.get(), timeout=1)
+            got_item = True
         except asyncio.TimeoutError:
             continue
         except asyncio.CancelledError:
@@ -83,4 +85,5 @@ async def worker(q: asyncio.Queue, results: list, ready_event: asyncio.Event):
         except Exception:
             pass
         finally:
-            q.task_done()
+            if got_item:
+                q.task_done()

@@ -47,43 +47,36 @@ def render():
     qbar_w = 30
     qfill = int(qbar_w * min(qd / 5000, 1))
     qbar = c("█" * qfill, 93) + c("░" * (qbar_w - qfill), 90)
-    sys.stdout.write(c(f"  ⚡ {r}/s  ⏱ {int(e)}s  📥 queue [{qbar}] {qd}\n", 90))
+    sys.stdout.write(c(f"  {r:>4}/s  {int(e):>6}s  queue [{qbar}] {qd:>5}\n", 90))
 
     dt = db_totals
     sys.stdout.write(c("╔" + "═" * 68 + "╗\n", 36))
     rows = [
-        ("🧬  SESSION", "⚡"),
-        ("🏃  GEN", stats["generated"]),
-        ("🎯  TEST", stats["tested"]),
-        ("🌐  HTTP", stats["http_ok"]),
-        ("💾  SAVED", stats["saved_e2"]),
-        ("✅  VRFYD", stats["verified"]),
+        ("SESSION", "GEN", stats["generated"]),
+        ("SESSION", "TEST", stats["tested"]),
+        ("SESSION", "HTTP", stats["http_ok"]),
+        ("SESSION", "SAVED", stats["saved_e2"]),
+        ("SESSION", "E3_OK", stats["verified"]),
     ]
-    for i in range(0, 6, 2):
-        l_name, l_val = rows[i]
-        r_name, r_val = rows[i + 1]
-        sys.stdout.write(c(f"║  {l_name:<7} {c(str(l_val),97):<10}  {r_name:<7} {c(str(r_val),97):<10}║\n", 90))
+    for label, key, val in rows:
+        sys.stdout.write(c(f"║  {label:<8} {key:<6} {c(str(val),97):>10}  {c('|',90)}", 90))
     sys.stdout.write(c("╠" + "═" * 68 + "╣\n", 36))
     rows2 = [
-        ("🗄️  DATABASE", "🏛️"),
-        ("📦  TOTAL", dt["total"]),
-        ("✅  E2_OK", dt["e2_ok"]),
-        ("🌟  E3_OK", dt["vplink_ok"]),
-        ("📥  QUEUE", stats["qdepth"]),
+        ("DB", "TOTAL", dt["total"]),
+        ("DB", "E2_OK", dt["e2_ok"]),
+        ("DB", "E3_OK", dt["vplink_ok"]),
     ]
-    for i in range(0, 6, 2):
-        l_name, l_val = rows2[i]
-        r_name, r_val = rows2[i + 1]
-        sys.stdout.write(c(f"║  {l_name:<7} {c(str(l_val),97):<10}  {r_name:<7} {c(str(r_val),97):<10}║\n", 90))
+    for label, key, val in rows2:
+        sys.stdout.write(c(f"║  {label:<8} {key:<6} {c(str(val),97):>10}  {c('|',90)}", 90))
     sys.stdout.write(c("╚" + "═" * 68 + "╝\n", 36))
 
     if stats["verified"] > 0:
         latest = runners[-3:] if runners else []
         sys.stdout.write(c("╔" + "═" * 68 + "╗\n", 92))
-        sys.stdout.write(c(f"║  ✅  E3 VERIFIED ({stats['verified']} this run)\n", 92))
+        sys.stdout.write(c(f"║  E3 VERIFIED  ({stats['verified']} this run)\n", 92))
         for v in reversed(latest):
-            tag = c("🏠", 92) if v.get("type") == "residential" else c("🏢", 93)
-            line = f"║  {tag} {v['ip']:>15}:{v['port']:<5} {v['latency']:>5}ms {v.get('country','?')}/{v.get('city','?')}"
+            tag = "R" if v.get("type") == "residential" else "D"
+            line = f"║  [{tag}] {v['ip']:>15}:{v['port']:<5} {v['latency']:>5}ms {v.get('country','?')}/{v.get('city','?')}"
             sys.stdout.write(c(line, 97) + "\n")
         sys.stdout.write(c("╚" + "═" * 68 + "╝\n", 92))
 
@@ -94,14 +87,15 @@ def render():
 async def e3_worker(e3_queue, stats, runners, e3_tracking):
     """Background: consumes from e3_queue, runs VPLINK check, updates DB."""
     while True:
+        got_item = False
         try:
             cand = await asyncio.wait_for(e3_queue.get(), timeout=1)
+            got_item = True
         except asyncio.TimeoutError:
             continue
         except asyncio.CancelledError:
             break
         try:
-            stats["e3_inflight"] = stats.get("e3_inflight", 0) + 1
             verified = await e3_verify(cand, do_vplink=True)
             if verified:
                 stats["verified"] += 1
@@ -116,8 +110,8 @@ async def e3_worker(e3_queue, stats, runners, e3_tracking):
         except Exception:
             e3_tracking["completed"] = e3_tracking.get("completed", 0) + 1
         finally:
-            stats["e3_inflight"] = max(0, stats.get("e3_inflight", 1) - 1)
-            e3_queue.task_done()
+            if got_item:
+                e3_queue.task_done()
 
 
 async def gen_worker(q, stats):
@@ -170,6 +164,14 @@ async def main_loop(args):
     conf = cfg.get()
     sb.init(conf["supabase_url"], conf["service_key"])
 
+    # Immediate DB totals fetch (don't wait for background task)
+    try:
+        counts = sb.get_counts()
+        if counts:
+            db_totals.update(counts)
+    except Exception:
+        pass
+
     render.t0 = time.time()
 
     q = asyncio.Queue(maxsize=50000)
@@ -198,7 +200,13 @@ async def main_loop(args):
         last_port_rebalance = time.time()
 
         while True:
-            await e2_event.wait()
+            stats["qdepth"] = q.qsize()
+
+            # Timeout on event wait — prevents deadlock when all proxies fail
+            try:
+                await asyncio.wait_for(e2_event.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
             e2_event.clear()
 
             while e2_results:
@@ -259,9 +267,14 @@ async def _render_loop():
     last_test = -1
     last_db = -1
     while True:
-        if stats["tested"] > last_test or db_totals["e2_ok"] > last_db:
+        refresh = False
+        if stats["tested"] > last_test:
             last_test = stats["tested"]
+            refresh = True
+        if db_totals.get("e2_ok", 0) > last_db:
             last_db = db_totals["e2_ok"]
+            refresh = True
+        if refresh:
             render()
         await asyncio.sleep(0.25)
 
@@ -286,9 +299,9 @@ def cmd_list(args):
     print(f"  Found {len(results)} proxy(es):")
     print()
     for r in results:
-        tag = "🏠" if r.get("type") == "residential" else "🏢" if r.get("type") == "datacenter" else "❓"
-        vp = "✅" if r.get("vplink_ok") else "❌"
-        print(f"  {tag} {r['ip']:>15}:{r['port']:<5}  {r.get('latency_ms','?'):>5}ms  "
+        tag = "R" if r.get("type") == "residential" else "D" if r.get("type") == "datacenter" else "?"
+        vp = "Y" if r.get("vplink_ok") else "N"
+        print(f"  [{tag}] {r['ip']:>15}:{r['port']:<5}  {r.get('latency_ms','?'):>5}ms  "
               f"{r.get('country','?'):<3}/{r.get('city','?'):<12}  "
               f"ISP: {r.get('isp','')[:25]:<25}  VPLINK:{vp}")
 
@@ -316,7 +329,7 @@ def cmd_delete(args):
     sb.init(conf["supabase_url"], conf["service_key"])
     ok = sb.delete_proxy(args.ip, args.port)
     if ok:
-        print(f"  [✓] Deleted {args.ip}:{args.port}")
+        print(f"  [OK] Deleted {args.ip}:{args.port}")
     else:
         print(f"  [!] Failed to delete {args.ip}:{args.port}")
 
@@ -358,8 +371,11 @@ def main():
     args = parser.parse_args()
 
     if args.reset_config:
-        os.remove(cfg.CONFIG_PATH)
-        print("  [✓] Config reset.")
+        if os.path.exists(cfg.CONFIG_PATH):
+            os.remove(cfg.CONFIG_PATH)
+            print("  [OK] Config reset.")
+        else:
+            print("  [!] No config file to reset.")
         return
 
     conf = cfg.get()
@@ -386,7 +402,7 @@ def main():
     if args.gen_api_key:
         conf["api_key"] = __import__("secrets").token_urlsafe(24)
         cfg.save(conf)
-        print(f"  [✓] API key: {conf['api_key']}")
+        print(f"  [OK] API key: {conf['api_key']}")
         print(f"  [i] Saved to {cfg.CONFIG_PATH}")
         return
 
