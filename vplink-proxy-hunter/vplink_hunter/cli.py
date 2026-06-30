@@ -115,19 +115,19 @@ async def e3_worker(e3_queue, stats, runners, e3_tracking):
 
 
 async def gen_worker(q, stats):
-    """Background: generates IP:port batches, adaptive batch size."""
+    """Generate in batches of 10k. Stop at 10k, resume when drained."""
     while True:
         depth = q.qsize()
         stats["qdepth"] = depth
-        if depth > 3000:
-            await asyncio.sleep(0.5)
+        if depth >= 10000:
+            await asyncio.sleep(1)
             continue
-        batch_size = 100 if depth > 2000 else 400 if depth > 500 else 800
+        batch_size = min(800, 10000 - depth)
         batch = gen_batch(batch_size)
         stats["generated"] += len(batch)
         for ip, port in batch:
             await q.put((ip, port))
-        await asyncio.sleep(0.05 if depth < 500 else 0.1)
+        await asyncio.sleep(0.05)
 
 
 async def db_stats_task(interval: int = 30):
@@ -174,7 +174,7 @@ async def main_loop(args):
 
     render.t0 = time.time()
 
-    q = asyncio.Queue(maxsize=50000)
+    q = asyncio.Queue(maxsize=15000)
     e2_results = deque()
     e3_queue = asyncio.Queue()
     e2_event = asyncio.Event()

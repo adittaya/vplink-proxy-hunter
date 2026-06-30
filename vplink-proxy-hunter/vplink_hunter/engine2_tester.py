@@ -54,14 +54,13 @@ async def test_one(ip: str, port: int) -> dict | None:
                 break
             response += chunk
     except asyncio.TimeoutError:
-        writer.close()
         return None
     except Exception:
-        writer.close()
         return None
     finally:
         try:
             writer.close()
+            await writer.wait_closed()
         except Exception:
             pass
 
