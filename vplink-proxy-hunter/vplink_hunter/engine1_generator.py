@@ -1,10 +1,9 @@
 """Engine 1 — Smart IP Generator + Proxy List Scraper.
 
 Generates random IP:port combos biased toward residential ISPs.
-Also scrapes known public proxy lists for immediate results."""
+Bias port selection toward ports with proven hit rates from Engine 2."""
 
 import asyncio
-import os
 import random
 import re
 import subprocess
@@ -89,6 +88,13 @@ PROXY_SOURCES = [
     ("plist_http", "https://www.proxy-list.download/api/v1/get?type=http"),
 ]
 
+_biased_ports = None
+
+
+def set_biased_ports(ports: list[int]):
+    global _biased_ports
+    _biased_ports = ports
+
 
 def _blocked_ip(ip: str) -> bool:
     return any(ip.startswith(prefix) for prefix in BLOCKED_SUBNETS)
@@ -105,8 +111,14 @@ def generate_ip() -> str:
             return ip
 
 
+_biased_ports_cache = None
+
+
 def generate_port():
-    return random.choice(PROXY_PORTS)
+    global _biased_ports_cache
+    ports = _biased_ports if _biased_ports else PROXY_PORTS
+    _biased_ports_cache = ports
+    return random.choice(ports)
 
 
 def generate() -> tuple:

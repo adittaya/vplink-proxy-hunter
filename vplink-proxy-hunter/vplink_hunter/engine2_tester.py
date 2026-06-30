@@ -1,64 +1,48 @@
 """Engine 2 — Rapid Fire Tester.
 
-TCP pre-check → HTTP GET via proxy.
-80+ async workers, ~40-50 IPs/s."""
+Single-step TCP+HTTP via httpx async client.
+No subprocess overhead, aggressive timeouts, crash-resistant workers."""
 
 import asyncio
-import json
 import time
-import subprocess
 from collections import defaultdict
+
+import httpx
 
 port_hits = defaultdict(int)
 port_tries = defaultdict(int)
 
 
-async def tcp_check(ip: str, port: int, timeout: int = 2) -> bool:
-    try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=timeout
-        )
-        writer.close()
-        await writer.wait_closed()
-        return True
-    except Exception:
-        return False
-
-
-async def http_test(ip: str, port: int, timeout: int = 6) -> dict | None:
-    proxy_url = f"http://{ip}:{port}"
-    cmd = [
-        "curl", "-s", "--connect-timeout", "3", "--max-time", str(timeout - 1),
-        "-x", proxy_url, "http://ipinfo.io/json",
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 1)
-        if proc.returncode != 0 or not out:
-            return None
-        data = json.loads(out.decode())
-        return data
-    except Exception:
-        return None
-
-
-async def test_one(ip: str, port: int) -> dict | None:
+async def test_one(ip: str, port: int, timeout: float = 8.0) -> dict | None:
     t0 = time.time()
+    port_tries[port] += 1
+    proxy_url = f"http://{ip}:{port}"
 
-    if not await tcp_check(ip, port, timeout=2):
+    try:
+        async with httpx.AsyncClient(
+            proxies={"http://": proxy_url, "https://": proxy_url},
+            timeout=httpx.Timeout(timeout, connect=3.0),
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get("http://ipinfo.io/json")
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+    except httpx.ConnectError:
         return None
-
-    info = await http_test(ip, port, timeout=6)
-    if not info:
+    except httpx.ConnectTimeout:
+        return None
+    except httpx.ReadTimeout:
+        return None
+    except httpx.ProxyError:
+        return None
+    except Exception:
         return None
 
     latency = round((time.time() - t0) * 1000)
-    org = (info.get("org") or "").lower()
-    ip_addr = info.get("ip", ip)
+    org = (data.get("org") or "").lower()
+    ip_addr = data.get("ip", ip)
 
-    port_tries[port] += 1
     port_hits[port] += 1
 
     return {
@@ -66,10 +50,10 @@ async def test_one(ip: str, port: int) -> dict | None:
         "port": port,
         "proto": "http",
         "latency": latency,
-        "isp": info.get("org", ""),
-        "country": info.get("country", ""),
-        "city": info.get("city", ""),
-        "region": info.get("region", ""),
+        "isp": data.get("org", ""),
+        "country": data.get("country", ""),
+        "city": data.get("city", ""),
+        "region": data.get("region", ""),
         "org": org,
     }
 
@@ -81,14 +65,22 @@ def best_ports(n: int = 10) -> list[int]:
     return [p for p, _ in scored[:n]]
 
 
-async def worker(q: asyncio.Queue, results: list):
+async def worker(q: asyncio.Queue, results: list, ready_event: asyncio.Event):
+    """Consume IP:port from queue, test via httpx, append result."""
     while True:
         try:
             ip, port = await asyncio.wait_for(q.get(), timeout=1)
         except asyncio.TimeoutError:
             continue
+        except asyncio.CancelledError:
+            break
         try:
             result = await test_one(ip, port)
             results.append(result)
+            ready_event.set()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
         finally:
             q.task_done()

@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from supabase import create_client, Client
 
@@ -23,7 +24,7 @@ def get() -> Client:
     return _client
 
 
-def upsert_proxy(proxy: dict):
+def upsert_proxy(proxy: dict, retries: int = 3):
     if not _client:
         _log("client not initialized")
         return
@@ -41,13 +42,19 @@ def upsert_proxy(proxy: dict):
         "e2_ok": proxy.get("e2_ok", True),
         "last_seen": "now()",
     }
-    try:
-        _client.table("proxy_results").upsert(
-            row,
-            on_conflict="ip,port",
-        ).execute()
-    except Exception as e:
-        _log(f"upsert error: {e}")
+    for attempt in range(retries):
+        try:
+            _client.table("proxy_results").upsert(
+                row,
+                on_conflict="ip,port",
+            ).execute()
+            return
+        except Exception as e:
+            if attempt < retries - 1:
+                import time as _time
+                _time.sleep(0.5 * (attempt + 1))
+            else:
+                _log(f"upsert error after {retries} attempts: {e}")
 
 
 def get_proxy(ip: str, port: int) -> dict | None:
@@ -117,6 +124,23 @@ def get_stats() -> dict:
         }
     except Exception:
         return {}
+
+
+def get_counts() -> dict:
+    """Fast COUNT queries for dashboard totals."""
+    if not _client:
+        return {"e2_ok": 0, "vplink_ok": 0, "total": 0}
+    try:
+        total = _client.table("proxy_results").select("count", count="exact").execute()
+        e2 = _client.table("proxy_results").select("count", count="exact").eq("e2_ok", True).execute()
+        vp = _client.table("proxy_results").select("count", count="exact").eq("vplink_ok", True).execute()
+        return {
+            "total": total.count if total.count else 0,
+            "e2_ok": e2.count if e2.count else 0,
+            "vplink_ok": vp.count if vp.count else 0,
+        }
+    except Exception:
+        return {"e2_ok": 0, "vplink_ok": 0, "total": 0}
 
 
 def update_stats(scanned: int, found: int, residential: int, dc: int):

@@ -1,13 +1,12 @@
 """Engine 3 — VPLINK Verifier + Residential Detector.
 
-Takes Engine 2 candidates, tests against VPLINK,
-classifies as residential/datacenter, upserts to Supabase."""
+httpx async client replaces curl subprocess.
+Proper timeout handling, crash-resistant, no fork overhead."""
 
 import asyncio
-import json
 import re
-import subprocess
-import time
+
+import httpx
 
 DATACENTER_ORGS = re.compile(
     r"alibaba|amazon|google|hetzner|ovh|digitalocean|vultr|"
@@ -30,43 +29,54 @@ WORKING_PATTERNS = re.compile(
 )
 
 
-async def check_vplink(ip: str, port: int, timeout: int = 12) -> dict:
-    """Test proxy against VPLINK. Returns {'ok': bool, 'detail': str}."""
+async def check_vplink(ip: str, port: int, timeout: float = 10.0) -> dict:
+    """Test proxy against VPLINK via httpx. Returns {'ok': bool, 'detail': str}."""
     proxy_url = f"http://{ip}:{port}"
-    cmd = [
-        "curl", "-s", "-L", "--connect-timeout", "5", "--max-time", str(timeout),
-        "-x", proxy_url,
-        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        VPLINK_TEST_URL,
-    ]
+
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 2)
-        if proc.returncode not in (0, 22):
-            return {"ok": False, "detail": "curl_failed"}
-        if not out:
-            return {"ok": False, "detail": "empty_response"}
-
-        text = out.decode("utf-8", errors="replace")
-
-        if VPN_DETECTED_PATTERNS.search(text):
-            return {"ok": False, "detail": "vpn_detected"}
-
-        if WORKING_PATTERNS.search(text) or len(text) > 500:
-            return {"ok": True, "detail": "passed"}
-
-        if len(text) < 200:
-            return {"ok": False, "detail": "too_short"}
-
-        return {"ok": False, "detail": "unknown"}
+        async with httpx.AsyncClient(
+            proxies={"http://": proxy_url, "https://": proxy_url},
+            timeout=httpx.Timeout(timeout, connect=5.0),
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(
+                VPLINK_TEST_URL,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                  "Chrome/120.0.0.0 Safari/537.36"
+                },
+            )
+            text = resp.text
+    except httpx.ConnectError:
+        return {"ok": False, "detail": "connect_failed"}
+    except httpx.ConnectTimeout:
+        return {"ok": False, "detail": "connect_timeout"}
+    except httpx.ReadTimeout:
+        return {"ok": False, "detail": "read_timeout"}
+    except httpx.ProxyError:
+        return {"ok": False, "detail": "proxy_error"}
+    except httpx.HTTPStatusError:
+        return {"ok": False, "detail": "http_error"}
     except Exception:
-        return {"ok": False, "detail": "exception"}
+        return {"ok": False, "detail": "unknown"}
+
+    if not text:
+        return {"ok": False, "detail": "empty_response"}
+
+    if VPN_DETECTED_PATTERNS.search(text):
+        return {"ok": False, "detail": "vpn_detected"}
+
+    if WORKING_PATTERNS.search(text) or len(text) > 500:
+        return {"ok": True, "detail": "passed"}
+
+    if len(text) < 200:
+        return {"ok": False, "detail": "too_short"}
+
+    return {"ok": False, "detail": "unknown_pattern"}
 
 
 def classify(org: str) -> str:
-    """Residential or datacenter based on org."""
     return "datacenter" if DATACENTER_ORGS.search(org.lower()) else "residential"
 
 
