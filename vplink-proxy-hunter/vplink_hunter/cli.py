@@ -85,8 +85,7 @@ def render():
     sys.stdout.flush()
 
 
-async def e3_worker(e3_queue, stats, runners, e3_tracking, verified_event=None):
-    """Background: consumes from e3_queue, runs VPLINK check, updates DB."""
+async def e3_worker(e3_queue, stats, runners, e3_tracking, restart_event):
     while True:
         got_item = False
         try:
@@ -105,8 +104,8 @@ async def e3_worker(e3_queue, stats, runners, e3_tracking, verified_event=None):
                     stats["residential"] += 1
                 verified["e2_ok"] = True
                 await sb.async_upsert_proxy(verified)
-                if verified_event:
-                    verified_event.set()
+                if stats["verified"] % 20 == 0:
+                    restart_event.set()
             e3_tracking["completed"] = e3_tracking.get("completed", 0) + 1
         except asyncio.CancelledError:
             break
@@ -303,7 +302,8 @@ async def main_loop(args):
                         subnets = {f"{ip.split('.')[0]}.{ip.split('.')[1]}" for ip in known_ips}
                         set_biased_subnets(subnets)
 
-            if stats["verified"] >= SESSION_RESTART_AFTER:
+            if e3_verified_event.is_set():
+                e3_verified_event.clear()
                 sys.stderr.write(f"[restart] {stats['verified']} verified — clean restart\n")
                 _restart_flag = True
                 break
