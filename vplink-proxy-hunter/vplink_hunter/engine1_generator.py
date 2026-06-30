@@ -1,10 +1,13 @@
-"""Engine 1 — Smart IP Generator.
+"""Engine 1 — Smart IP Generator + Proxy List Scraper.
 
-Generates random IP:port combos, skipping known datacenter ranges
-and targeting residential ISP blocks."""
+Generates random IP:port combos biased toward residential ISPs.
+Also scrapes known public proxy lists for immediate results."""
 
+import asyncio
 import os
 import random
+import re
+import subprocess
 
 PROXY_PORTS = [
     80, 81, 443, 8080, 8081, 8443,
@@ -32,8 +35,6 @@ PROXY_PORTS = [
     63333, 64444, 65535,
 ]
 
-# Known datacenter/cloud first octets to bias AWAY from
-# We weight these lower, not eliminate entirely
 DC_FIRST_OCTETS = {
     3, 13, 15, 16, 17, 18, 19, 20, 34, 35,
     44, 52, 54, 55, 56, 98, 99, 100, 104, 107,
@@ -46,7 +47,6 @@ DC_FIRST_OCTETS = {
     206, 207, 208, 209, 216,
 }
 
-# Residential-heavy first octets (ISP owned) — higher weight
 RES_FIRST_OCTETS = [
     1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12,
     14, 21, 22, 23, 24, 25, 26, 27, 28, 29,
@@ -66,10 +66,7 @@ RES_FIRST_OCTETS = [
     223,
 ]
 
-# Weight: residential octets more likely
 _WEIGHTS = [10 if o in RES_FIRST_OCTETS else 1 for o in range(1, 224)]
-
-# Ensure no ranges outside 1-223
 _WEIGHTS = _WEIGHTS[:223]
 
 BLOCKED_SUBNETS = [
@@ -80,6 +77,16 @@ BLOCKED_SUBNETS = [
     "231.", "232.", "233.", "234.", "235.", "236.", "237.", "238.",
     "239.", "240.", "241.", "242.", "243.", "244.", "245.", "246.",
     "247.", "248.", "249.", "250.", "251.", "252.", "253.", "254.", "255.",
+]
+
+IP_RE = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*[:\s]\s*(\d+)")
+
+PROXY_SOURCES = [
+    ("proxyscrape_http", "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all"),
+    ("speedx_http", "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt"),
+    ("shifty_http", "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt"),
+    ("jetkai_http", "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies_http.txt"),
+    ("plist_http", "https://www.proxy-list.download/api/v1/get?type=http"),
 ]
 
 
@@ -108,3 +115,39 @@ def generate() -> tuple:
 
 def batch(count: int = 2000) -> list:
     return [generate() for _ in range(count)]
+
+
+async def fetch_url(url: str, timeout: int = 10) -> str:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-sL", "--max-time", str(timeout),
+            url, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 2)
+        return out.decode(errors="replace")
+    except Exception:
+        return ""
+
+
+async def scrape_lists() -> list[tuple[str, int]]:
+    """Fetch known working proxies from public lists."""
+    seen = set()
+    proxies = []
+
+    async def fetch_source(name, url):
+        text = await fetch_url(url)
+        found = 0
+        for match in IP_RE.finditer(text):
+            ip, port_str = match.groups()
+            port = int(port_str)
+            key = (ip, port)
+            if key not in seen and not _blocked_ip(ip):
+                seen.add(key)
+                proxies.append((ip, port))
+                found += 1
+        return name, found
+
+    tasks = [fetch_source(name, url) for name, url in PROXY_SOURCES]
+    results = await asyncio.gather(*tasks)
+
+    return proxies

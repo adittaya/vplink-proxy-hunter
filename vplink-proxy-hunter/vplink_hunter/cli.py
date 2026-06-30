@@ -12,7 +12,7 @@ import time
 
 from . import config as cfg
 from . import supabase_client as sb
-from .engine1_generator import batch as gen_batch
+from .engine1_generator import batch as gen_batch, scrape_lists
 from .engine2_tester import test_one, worker as e2_worker
 from .engine3_verifier import verify as e3_verify
 
@@ -89,6 +89,13 @@ async def main_loop(args):
     render_task = asyncio.create_task(_render_loop())
 
     try:
+        scraped = await scrape_lists()
+        if scraped:
+            for ip, port in scraped:
+                await q.put((ip, port))
+            stats["generated"] += len(scraped)
+            print(f"  [i] Scraped {len(scraped)} proxies from public lists")
+
         while True:
             batch = gen_batch(2000)
             stats["generated"] += len(batch)
