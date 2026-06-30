@@ -69,3 +69,14 @@ def get():
     if not cfg:
         cfg = prompt_and_save()
     return cfg
+
+
+def get_api_key():
+    cfg = get()
+    key = cfg.get("api_key", "")
+    if not key:
+        import secrets
+        key = secrets.token_urlsafe(24)
+        cfg["api_key"] = key
+        save(cfg)
+    return key
