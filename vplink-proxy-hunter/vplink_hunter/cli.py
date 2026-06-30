@@ -229,12 +229,18 @@ async def main_loop(args):
         while True:
             stats["qdepth"] = q.qsize()
 
+            if _restart_flag:
+                break
+
             # Timeout on event wait — prevents deadlock when all proxies fail
             try:
                 await asyncio.wait_for(e2_event.wait(), timeout=0.5)
             except asyncio.TimeoutError:
                 pass
             e2_event.clear()
+
+            if _restart_flag:
+                break
 
             while e2_results:
                 cand = e2_results.popleft()
@@ -271,6 +277,16 @@ async def main_loop(args):
                 e3_tracking["enqueued"] += 1
                 e3_queue.put_nowait(cand)
 
+                # Check restart immediately after each result
+                if e3_verified_event.is_set():
+                    e3_verified_event.clear()
+                    sys.stderr.write(f"[restart] {stats['verified']} verified — clean restart\n")
+                    _restart_flag = True
+                    break
+
+            if _restart_flag:
+                break
+
             now = time.time()
             if stats["tested"] == stats.get("_last_tested", 0) and stats["tested"] > 0:
                 if now - stats.get("_stall_warned", 0) > 30:
@@ -306,7 +322,6 @@ async def main_loop(args):
                 e3_verified_event.clear()
                 sys.stderr.write(f"[restart] {stats['verified']} verified — clean restart\n")
                 _restart_flag = True
-                break
 
             if args.once:
                 all_e2_done = q.qsize() == 0 and not e2_results
