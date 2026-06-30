@@ -28,9 +28,6 @@ stats = dict(generated=0, tested=0, open_port=0, http_ok=0,
              residential=0, verified=0, saved_e2=0, qdepth=0)
 db_totals = dict(total=0, e2_ok=0, vplink_ok=0, residential=0)
 runners = []
-_restart_flag = False
-
-
 def render():
     os.system("clear" if os.name == "posix" else "cls")
     e = time.time() - render.t0
@@ -282,8 +279,15 @@ async def main_loop(args):
                 e3_verified_event.clear()
                 run_verified += 1
             if run_verified >= SESSION_RESTART_AFTER:
-                _restart_flag = True
-                break
+                sys.stderr.write(f"[restart] {run_verified} verified — session reset (workers stay up)\n")
+                run_verified = 0
+                for k in ("generated", "tested", "http_ok", "saved_e2", "verified", "residential"):
+                    stats[k] = 0
+                runners.clear()
+                e3_tracking["enqueued"] = 0
+                e3_tracking["completed"] = 0
+                render.t0 = time.time()
+                continue
 
             if args.once:
                 all_e2_done = q.qsize() == 0 and not e2_results
@@ -390,23 +394,10 @@ def cmd_delete(args):
 
 
 def _run(args):
-    global _restart_flag
-    while True:
-        _restart_flag = False
-        try:
-            asyncio.run(main_loop(args))
-        except asyncio.CancelledError:
-            break
-        except KeyboardInterrupt:
-            break
-        except Exception as exc:
-            sys.stderr.write(f"[!] Crash: {exc}. Restarting in 3s...\n")
-            time.sleep(3)
-            continue
-        if _restart_flag:
-            sys.stderr.write("[restart] 20 verified — clean restart\n")
-            continue
-        break
+    try:
+        asyncio.run(main_loop(args))
+    except KeyboardInterrupt:
+        pass
 
 
 def main():
