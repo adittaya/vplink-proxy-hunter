@@ -165,7 +165,7 @@ def serve(port: int = 8080, host: str = "0.0.0.0"):
 
     API_KEY = conf.get("api_key", "")
     if not API_KEY:
-        API_KEY = secrets.token_urlhex(24) if hasattr(secrets, 'token_urlhex') else secrets.token_urlsafe(24)
+        API_KEY = secrets.token_urlsafe(24)
         conf["api_key"] = API_KEY
         cfg.save(conf)
         print(f"  [i] Generated new API key")

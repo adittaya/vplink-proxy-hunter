@@ -1,20 +1,32 @@
 """Engine 3 — VPLINK Verifier + Residential Detector.
 
-httpx async through proxy (singular kwarg for 0.28+).
-Proper timeout handling, crash-resistant, no subprocess overhead."""
+Uses curl via subprocess for reliable CONNECT tunnel + TLS handling.
+Avoids httpx proxy configuration incompatibilities across versions."""
 
 import asyncio
 import re
-
-import httpx
+import subprocess
 
 DATACENTER_ORGS = re.compile(
     r"alibaba|amazon|google|hetzner|ovh|digitalocean|vultr|"
     r"linode|microsoft|oracle|ibm|rackspace|softlayer|scaleway|"
     r"contabo|netcup|cogent|datacamp|zenlayer|psychz|gige|choopa|"
-    r"sharktech|cloudflare|vps|dedicated|hosting|colocrossing|"
+    r"sharktech|cloudflare|vps\b|dedicated|hosting|colocrossing|"
     r"theplanet|leaseweb|akamai|stackpath|oneprovider|worldstream|"
-    r"buyvm|snel|racknerd|hostiger|nfry|serverel|choopa|zare"
+    r"buyvm|snel|racknerd|hostiger|nfry|serverel|choopa|zare|"
+    r"tencent|dpkgsoft|m247|mevspace|terrahost|"
+    r"datapacket|multacom|crosslayer|hosthat|astrohost|"
+    r"gcore|lansrv|hitron|voxility|datawise|"
+    r"firstheberg|starline|develapp|itltd|zenex|"
+    r"naver[^a-z]|nhn\s|kakao\s|kt\s*cloud|lg.?cns|"
+    r"ionos|hostinger|hostgator|bluehost|godaddy|dreamhost|"
+    r"a2\s*hosting|siteground|inmotion|liquid.?web|"
+    r"kinsta|wp.?engine|namecheap|hostarmada|kamatera|"
+    r"interserver|cloudways|greengeeks|scalahosting|"
+    r"fastcomet|chemicloud|tmdhosting|verpex|servers\.com|"
+    r"phoenixnap|hivelocity|hostwinds|hostpapa|"
+    r"coreweave|equinix|digital.?realty|flexential|"
+    r"cyxtera|vapor.?io|iron.?mountain"
 )
 
 VPLINK_TEST_URL = "https://vplink.in/UbpV2D"
@@ -29,37 +41,36 @@ WORKING_PATTERNS = re.compile(
 )
 
 
-async def check_vplink(ip: str, port: int, timeout: float = 10.0) -> dict:
-    """Test proxy against VPLINK via httpx. Returns {'ok': bool, 'detail': str}."""
-    proxy_url = f"http://{ip}:{port}"
-
+async def _curl_get(url: str, proxy: str, timeout: int = 12) -> str | None:
+    """Fetch URL through proxy via curl subprocess."""
+    cmd = [
+        "curl", "-sL", "--max-time", str(timeout),
+        "-x", proxy,
+        url,
+    ]
     try:
-        async with httpx.AsyncClient(
-            proxy=proxy_url,
-            timeout=httpx.Timeout(timeout, connect=5.0),
-            follow_redirects=True,
-        ) as client:
-            resp = await client.get(
-                VPLINK_TEST_URL,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                  "Chrome/120.0.0.0 Safari/537.36"
-                },
-            )
-            text = resp.text
-    except httpx.ConnectError:
-        return {"ok": False, "detail": "connect_failed"}
-    except httpx.ConnectTimeout:
-        return {"ok": False, "detail": "connect_timeout"}
-    except httpx.ReadTimeout:
-        return {"ok": False, "detail": "read_timeout"}
-    except httpx.ProxyError:
-        return {"ok": False, "detail": "proxy_error"}
-    except httpx.HTTPStatusError:
-        return {"ok": False, "detail": "http_error"}
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 2)
+        if proc.returncode != 0 or not out:
+            return None
+        return out.decode(errors="replace")
     except Exception:
-        return {"ok": False, "detail": "unknown"}
+        return None
+
+
+async def check_vplink(ip: str, port: int, timeout: float = 10.0) -> dict:
+    """Test proxy against VPLINK via curl subprocess.
+    
+    Uses curl -x through the proxy for reliable CONNECT tunnel + TLS.
+    Avoids httpx proxy configuration incompatibilities across versions.
+    Returns {'ok': bool, 'detail': str}."""
+    proxy_url = f"http://{ip}:{port}"
+    text = await _curl_get(VPLINK_TEST_URL, proxy_url, timeout=int(timeout))
+
+    if text is None:
+        return {"ok": False, "detail": "curl_failed"}
 
     if not text:
         return {"ok": False, "detail": "empty_response"}
@@ -88,6 +99,8 @@ async def verify(candidate: dict, do_vplink: bool = True) -> dict | None:
         vplink_result = await check_vplink(candidate["ip"], candidate["port"])
         if not vplink_result["ok"]:
             return None
+    else:
+        vplink_result["ok"] = True
 
     proxy_type = classify(candidate.get("org", ""))
 

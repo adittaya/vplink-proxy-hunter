@@ -70,7 +70,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test proxy connections from database")
     parser.add_argument("--type", choices=["residential", "datacenter"], default="residential")
     parser.add_argument("--count", type=int, default=5, help="Number of proxies to test")
-    parser.add_argument("--vplink", action="store_true", default=True, help="Only VPLINK-verified")
+    parser.add_argument("--vplink", action="store_true", default=False, help="Only VPLINK-verified")
     args = parser.parse_args()
 
     config = load_config()

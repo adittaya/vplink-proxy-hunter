@@ -81,6 +81,10 @@ async def test_one(ip: str, port: int) -> dict | None:
     org = (data.get("org") or "").lower()
     ip_addr = data.get("ip", ip)
 
+    # Verify HTTPS CONNECT support — most real-world usage requires it
+    if not await _check_connect(ip, port):
+        return None
+
     port_hits[port] += 1
 
     return {
@@ -94,6 +98,29 @@ async def test_one(ip: str, port: int) -> dict | None:
         "region": data.get("region", ""),
         "org": org,
     }
+
+
+async def _check_connect(ip: str, port: int) -> bool:
+    """Quick CONNECT tunnel test — proxy must support HTTPS tunneling."""
+    connect_req = (
+        "CONNECT ipinfo.io:443 HTTP/1.1\r\n"
+        "Host: ipinfo.io:443\r\n"
+        "\r\n"
+    ).encode()
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=5
+        )
+        try:
+            writer.write(connect_req)
+            await asyncio.wait_for(writer.drain(), timeout=3)
+            resp = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+            return resp.startswith(b"HTTP/1.1 200") or resp.startswith(b"HTTP/1.0 200")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    except Exception:
+        return False
 
 
 def best_ports(n: int = 10) -> list[int]:

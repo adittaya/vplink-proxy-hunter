@@ -33,13 +33,61 @@ COUNTRY_PREFIXES = {
 
 PREFIX_KEYS = list(COUNTRY_PREFIXES.keys())
 
+_BLOCKED = [
+    "0.", "10.", "127.", "169.254.",
+    "172.16.", "172.17.", "172.18.", "172.19.",
+    "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+    "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+    "192.168.", "100.64.", "100.65.", "100.66.", "100.67.", "100.68.",
+    "100.69.", "100.70.", "100.71.", "100.72.", "100.73.", "100.74.",
+    "100.75.", "100.76.", "100.77.", "100.78.", "100.79.", "100.80.",
+    "100.81.", "100.82.", "100.83.", "100.84.", "100.85.", "100.86.",
+    "100.87.", "100.88.", "100.89.", "100.90.", "100.91.", "100.92.",
+    "100.93.", "100.94.", "100.95.", "100.96.", "100.97.", "100.98.",
+    "100.99.", "100.100.", "100.101.", "100.102.", "100.103.", "100.104.",
+    "100.105.", "100.106.", "100.107.", "100.108.", "100.109.", "100.110.",
+    "100.111.", "100.112.", "100.113.", "100.114.", "100.115.", "100.116.",
+    "100.117.", "100.118.", "100.119.", "100.120.", "100.121.", "100.122.",
+    "100.123.", "100.124.", "100.125.", "100.126.", "100.127.",
+    "192.0.0.", "192.0.2.", "192.88.99.", "198.18.", "198.19.", "198.51.100.",
+    "203.0.113.",
+    # DoD /8s — allocated but generally not publicly routable
+    "6.", "7.", "11.", "21.", "22.",
+    "26.", "28.", "29.", "30.", "33.",
+    "48.", "53.", "57.",
+    "214.", "215.",
+    # Multicast + reserved
+    "224.", "225.", "226.", "227.", "228.", "229.", "230.",
+    "231.", "232.", "233.", "234.", "235.", "236.", "237.", "238.",
+    "239.", "240.", "241.", "242.", "243.", "244.", "245.", "246.",
+    "247.", "248.", "249.", "250.", "251.", "252.", "253.", "254.", "255.",
+]
+
+
+def _blocked_ip(ip: str) -> bool:
+    return any(ip.startswith(p) for p in _BLOCKED)
+
+
 DATACENTER_ORGS = [
     "alibaba", "amazon", "google", "hetzner", "ovh", "digitalocean", "vultr",
     "linode", "microsoft", "oracle", "ibm", "rackspace", "softlayer", "scaleway",
-    "contabo", "netcup", "cogent", "ipxo", "datacamp", "zenlayer", "psychz",
+    "contabo", "netcup", "cogent", "datacamp", "zenlayer", "psychz",
     "gige", "choopa", "sharktech", "cloudflare", "vps", "dedicated", "hosting",
     "colocrossing", "theplanet", "leaseweb", "akamai", "incapsula", "stackpath",
     "oneprovider", "worldstream", "buyvm", "snel", "racknerd", "hostiger",
+    "tencent", "dpkgsoft", "m247", "mevspace", "terrahost",
+    "datapacket", "multacom", "crosslayer", "hosthat", "astrohost",
+    "gcore", "lansrv", "hitron", "voxility", "datawise",
+    "firstheberg", "starline", "develapp", "itltd", "zenex",
+    "naver business", "naver cloud", "nhn", "kakao", "kt cloud",
+    "ionos", "hostinger", "hostgator", "bluehost", "godaddy", "dreamhost",
+    "a2 hosting", "siteground", "inmotion", "liquid web",
+    "kinsta", "wp engine", "namecheap", "hostarmada", "kamatera",
+    "interserver", "cloudways", "greengeeks", "scalahosting",
+    "fastcomet", "chemicloud", "tmdhosting", "verpex", "servers.com",
+    "phoenixnap", "hivelocity", "hostwinds", "hostpapa",
+    "coreweave", "equinix", "digital realty", "flexential",
+    "cyxtera", "vapor.io", "iron mountain",
 ]
 
 
@@ -48,11 +96,14 @@ def c(s, code=0):
 
 
 def random_ip():
-    country = random.choice(PREFIX_KEYS)
-    lo, hi = random.choice(COUNTRY_PREFIXES[country])
-    a = random.randint(lo, hi) if lo != hi else lo
-    a = max(1, min(223, a))
-    return f"{a}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(2,253)}", country
+    while True:
+        country = random.choice(PREFIX_KEYS)
+        lo, hi = random.choice(COUNTRY_PREFIXES[country])
+        a = random.randint(lo, hi) if lo != hi else lo
+        a = max(1, min(223, a))
+        ip = f"{a}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(2,253)}"
+        if not _blocked_ip(ip):
+            return ip, country
 
 
 def generate_target():
@@ -264,7 +315,7 @@ class ProxyFinder:
                 batch = await self.engine1(2000)
                 for item in batch:
                     await q.put(item)
-        except KeyboardInterrupt:
+        except asyncio.CancelledError:
             pass
         finally:
             self.running = False

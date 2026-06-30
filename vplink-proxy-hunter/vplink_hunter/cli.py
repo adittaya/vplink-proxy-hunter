@@ -11,10 +11,11 @@ import os
 import sys
 import time
 from collections import deque
+from datetime import datetime, timedelta, timezone
 
 from . import config as cfg
 from . import supabase_client as sb
-from .engine1_generator import batch as gen_batch, scrape_lists, set_biased_ports
+from .engine1_generator import batch as gen_batch, scrape_lists, set_biased_ports, set_biased_subnets
 from .engine2_tester import worker as e2_worker, best_ports
 from .engine3_verifier import verify as e3_verify
 
@@ -25,7 +26,7 @@ def c(s, code=0):
 
 stats = dict(generated=0, tested=0, open_port=0, http_ok=0,
              residential=0, verified=0, saved_e2=0, qdepth=0)
-db_totals = dict(total=0, e2_ok=0, vplink_ok=0)
+db_totals = dict(total=0, e2_ok=0, vplink_ok=0, residential=0)
 runners = []
 
 
@@ -63,6 +64,7 @@ def render():
     sys.stdout.write(c("╠" + "═" * 68 + "╣\n", 36))
     rows2 = [
         ("DB", "TOTAL", dt["total"]),
+        ("DB", "RES", dt.get("residential", 0)),
         ("DB", "E2_OK", dt["e2_ok"]),
         ("DB", "E3_OK", dt["vplink_ok"]),
     ]
@@ -103,7 +105,7 @@ async def e3_worker(e3_queue, stats, runners, e3_tracking):
                 if verified["type"] == "residential":
                     stats["residential"] += 1
                 verified["e2_ok"] = True
-                sb.upsert_proxy(verified)
+                await sb.async_upsert_proxy(verified)
             e3_tracking["completed"] = e3_tracking.get("completed", 0) + 1
         except asyncio.CancelledError:
             break
@@ -130,7 +132,7 @@ async def gen_worker(q, stats):
         await asyncio.sleep(0.05)
 
 
-async def db_stats_task(interval: int = 30):
+async def db_stats_task(interval: int = 10):
     """Refresh DB totals from Supabase every N seconds."""
     while True:
         try:
@@ -149,12 +151,16 @@ async def stale_cleanup_task(interval: int = 300):
         try:
             db = sb.get()
             if db:
-                cutoff = (time.time() - 3600) * 1000
+                cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
                 resp = db.table("proxy_results").select("ip,port").lt("last_seen", cutoff).execute()
                 if resp.data:
                     for row in resp.data:
                         db.table("proxy_results").delete().eq("ip", row["ip"]).eq("port", row["port"]).execute()
                     sys.stderr.write(f"[cleanup] removed {len(resp.data)} stale proxies\n")
+                    # Refresh DB totals immediately
+                    counts = sb.get_counts()
+                    if counts:
+                        db_totals.update(counts)
         except Exception:
             pass
         await asyncio.sleep(interval)
@@ -163,6 +169,15 @@ async def stale_cleanup_task(interval: int = 300):
 async def main_loop(args):
     conf = cfg.get()
     sb.init(conf["supabase_url"], conf["service_key"])
+
+    # Bootstrap /16 subnets from DB — start biased toward proven ranges
+    try:
+        known_subnets = await sb.async_get_subnets()
+        if known_subnets:
+            set_biased_subnets(known_subnets)
+            sys.stderr.write(f"[boot] loaded {len(known_subnets)} /16 subnets from DB\n")
+    except Exception:
+        pass
 
     # Immediate DB totals fetch (don't wait for background task)
     try:
@@ -179,6 +194,7 @@ async def main_loop(args):
     e3_queue = asyncio.Queue()
     e2_event = asyncio.Event()
     e3_tracking = {"enqueued": 0, "completed": 0}
+    known_subnets: set[str] = set()
 
     e2_pool = [asyncio.create_task(e2_worker(q, e2_results, e2_event))
                for _ in range(80)]
@@ -186,6 +202,7 @@ async def main_loop(args):
                for _ in range(max(1, args.e3_concurrency))]
     render_task = asyncio.create_task(_render_loop())
 
+    gen_task = cleanup_task = db_stats_task_handle = None
     try:
         scraped = await scrape_lists()
         if scraped:
@@ -217,7 +234,7 @@ async def main_loop(args):
                 stats["http_ok"] += 1
 
                 # Preserve existing vplink_ok/type from DB — don't erase E3 results
-                existing = sb.get_proxy(cand["ip"], cand["port"])
+                existing = await sb.async_get_proxy(cand["ip"], cand["port"])
                 existing_vplink = existing.get("vplink_ok", False) if existing else False
                 existing_type = existing.get("type", "unknown") if existing else "unknown"
 
@@ -234,8 +251,12 @@ async def main_loop(args):
                     "vplink_ok": existing_vplink,
                     "e2_ok": True,
                 }
-                sb.upsert_proxy(e2_entry)
+                await sb.async_upsert_proxy(e2_entry)
                 stats["saved_e2"] += 1
+                # Track /16 subnet for generator bias
+                ip_parts = cand["ip"].split(".")
+                if len(ip_parts) >= 2:
+                    known_subnets.add(f"{ip_parts[0]}.{ip_parts[1]}")
                 e3_tracking["enqueued"] += 1
                 e3_queue.put_nowait(cand)
 
@@ -245,6 +266,8 @@ async def main_loop(args):
                 good = best_ports(20)
                 if good:
                     set_biased_ports(good)
+                if known_subnets:
+                    set_biased_subnets(known_subnets)
 
             if args.once:
                 all_e2_done = q.qsize() == 0 and not e2_results
@@ -256,33 +279,42 @@ async def main_loop(args):
     except asyncio.CancelledError:
         pass
     finally:
-        gen_task.cancel()
+        if gen_task:
+            gen_task.cancel()
         render_task.cancel()
-        cleanup_task.cancel()
-        db_stats_task_handle.cancel()
+        if cleanup_task:
+            cleanup_task.cancel()
+        if db_stats_task_handle:
+            db_stats_task_handle.cancel()
         for w in e2_pool + e3_pool:
             w.cancel()
-        await asyncio.gather(gen_task, render_task, cleanup_task,
-                             db_stats_task_handle, *e2_pool, *e3_pool,
-                             return_exceptions=True)
+        tasks_to_gather = [render_task, *e2_pool, *e3_pool]
+        if gen_task:
+            tasks_to_gather.append(gen_task)
+        if cleanup_task:
+            tasks_to_gather.append(cleanup_task)
+        if db_stats_task_handle:
+            tasks_to_gather.append(db_stats_task_handle)
+        await asyncio.gather(*tasks_to_gather, return_exceptions=True)
 
     render()
 
 
 async def _render_loop():
     last_test = -1
-    last_db = -1
+    last_db_state = None
     while True:
         refresh = False
         if stats["tested"] > last_test:
             last_test = stats["tested"]
             refresh = True
-        if db_totals.get("e2_ok", 0) > last_db:
-            last_db = db_totals["e2_ok"]
+        state = (db_totals.get("total"), db_totals.get("e2_ok"), db_totals.get("vplink_ok"), db_totals.get("residential"))
+        if state != last_db_state:
+            last_db_state = state
             refresh = True
         if refresh:
             render()
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.5)
 
 
 def cmd_list(args):

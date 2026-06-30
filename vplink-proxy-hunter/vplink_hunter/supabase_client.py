@@ -1,5 +1,7 @@
 import asyncio
+import functools
 import sys
+from datetime import datetime, timezone
 from supabase import create_client, Client
 
 _client = None
@@ -40,7 +42,7 @@ def upsert_proxy(proxy: dict, retries: int = 3):
         "region": proxy.get("region", ""),
         "vplink_ok": proxy.get("vplink_ok", False),
         "e2_ok": proxy.get("e2_ok", True),
-        "last_seen": "now()",
+        "last_seen": datetime.now(timezone.utc).isoformat(),
     }
     for attempt in range(retries):
         try:
@@ -129,18 +131,20 @@ def get_stats() -> dict:
 def get_counts() -> dict:
     """Fast COUNT queries for dashboard totals."""
     if not _client:
-        return {"e2_ok": 0, "vplink_ok": 0, "total": 0}
+        return {"total": 0, "e2_ok": 0, "vplink_ok": 0, "residential": 0}
     try:
         total = _client.table("proxy_results").select("count", count="exact").execute()
         e2 = _client.table("proxy_results").select("count", count="exact").eq("e2_ok", True).execute()
         vp = _client.table("proxy_results").select("count", count="exact").eq("vplink_ok", True).execute()
+        res = _client.table("proxy_results").select("count", count="exact").eq("type", "residential").execute()
         return {
             "total": total.count if total.count else 0,
             "e2_ok": e2.count if e2.count else 0,
             "vplink_ok": vp.count if vp.count else 0,
+            "residential": res.count if res.count else 0,
         }
     except Exception:
-        return {"e2_ok": 0, "vplink_ok": 0, "total": 0}
+        return {"total": 0, "e2_ok": 0, "vplink_ok": 0, "residential": 0}
 
 
 def update_stats(scanned: int, found: int, residential: int, dc: int):
@@ -155,3 +159,34 @@ def update_stats(scanned: int, found: int, residential: int, dc: int):
         }).execute()
     except Exception:
         pass
+
+
+async def async_upsert_proxy(proxy: dict, retries: int = 3):
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, functools.partial(upsert_proxy, proxy, retries))
+
+
+def get_successful_subnets() -> set[str]:
+    """Return set of 'A.B' /16 subnets from proxies that passed E2."""
+    if not _client:
+        return set()
+    try:
+        resp = _client.table("proxy_results").select("ip").eq("e2_ok", True).execute()
+        subnets: set[str] = set()
+        for row in resp.data:
+            parts = row["ip"].split(".")
+            if len(parts) >= 2:
+                subnets.add(f"{parts[0]}.{parts[1]}")
+        return subnets
+    except Exception:
+        return set()
+
+
+async def async_get_subnets() -> set[str]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, get_successful_subnets)
+
+
+async def async_get_proxy(ip: str, port: int) -> dict | None:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(get_proxy, ip, port))
