@@ -28,6 +28,7 @@ stats = dict(generated=0, tested=0, open_port=0, http_ok=0,
              residential=0, verified=0, saved_e2=0, qdepth=0)
 db_totals = dict(total=0, e2_ok=0, vplink_ok=0, residential=0)
 runners = []
+_restart_flag = False
 
 
 def render():
@@ -86,7 +87,7 @@ def render():
     sys.stdout.flush()
 
 
-async def e3_worker(e3_queue, stats, runners, e3_tracking):
+async def e3_worker(e3_queue, stats, runners, e3_tracking, verified_event=None):
     """Background: consumes from e3_queue, runs VPLINK check, updates DB."""
     while True:
         got_item = False
@@ -106,6 +107,8 @@ async def e3_worker(e3_queue, stats, runners, e3_tracking):
                     stats["residential"] += 1
                 verified["e2_ok"] = True
                 await sb.async_upsert_proxy(verified)
+                if verified_event:
+                    verified_event.set()
             e3_tracking["completed"] = e3_tracking.get("completed", 0) + 1
         except asyncio.CancelledError:
             break
@@ -180,6 +183,9 @@ async def main_loop(args):
     conf = cfg.get()
     sb.init(conf["supabase_url"], conf["service_key"])
 
+    SESSION_RESTART_AFTER = 20
+    run_verified = 0
+
     # Bootstrap /16 subnets from DB — start biased toward proven ranges
     try:
         known_subnets = await sb.async_get_subnets()
@@ -204,11 +210,12 @@ async def main_loop(args):
     e3_queue = asyncio.Queue()
     e2_event = asyncio.Event()
     e3_tracking = {"enqueued": 0, "completed": 0}
+    e3_verified_event = asyncio.Event()
     known_subnets: set[str] = set()
 
     e2_pool = [asyncio.create_task(e2_worker(q, e2_results, e2_event))
                for _ in range(80)]
-    e3_pool = [asyncio.create_task(e3_worker(e3_queue, stats, runners, e3_tracking))
+    e3_pool = [asyncio.create_task(e3_worker(e3_queue, stats, runners, e3_tracking, e3_verified_event))
                for _ in range(max(1, args.e3_concurrency))]
     render_task = asyncio.create_task(_render_loop())
 
@@ -279,6 +286,13 @@ async def main_loop(args):
                     set_biased_ports(good)
                 if known_subnets:
                     set_biased_subnets(known_subnets)
+
+            if e3_verified_event.is_set():
+                e3_verified_event.clear()
+                run_verified += 1
+            if run_verified >= SESSION_RESTART_AFTER:
+                _restart_flag = True
+                break
 
             if args.once:
                 all_e2_done = q.qsize() == 0 and not e2_results
@@ -384,7 +398,9 @@ def cmd_delete(args):
 
 
 def _run(args):
+    global _restart_flag
     while True:
+        _restart_flag = False
         try:
             asyncio.run(main_loop(args))
         except asyncio.CancelledError:
@@ -394,6 +410,9 @@ def _run(args):
         except Exception as exc:
             sys.stderr.write(f"[!] Crash: {exc}. Restarting in 3s...\n")
             time.sleep(3)
+            continue
+        if _restart_flag:
+            sys.stderr.write("[restart] 20 verified — clean restart\n")
             continue
         break
 
