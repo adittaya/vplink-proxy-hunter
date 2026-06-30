@@ -217,13 +217,8 @@ async def main_loop(args):
         scraped = await scrape_lists()
         if scraped:
             sys.stderr.write(f"[boot] scraped {len(scraped)} proxies from lists\n")
-            # Rate-limit scraped proxies to avoid clogging queue
-            for i, (ip, port) in enumerate(scraped):
-                if q.qsize() >= 500:
-                    await asyncio.sleep(0.3)
+            for ip, port in scraped:
                 await q.put((ip, port))
-                if i % 100 == 0:
-                    await asyncio.sleep(0.01)
             stats["generated"] += len(scraped)
 
         gen_task = asyncio.create_task(gen_worker(q, stats))
