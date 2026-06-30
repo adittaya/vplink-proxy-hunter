@@ -9,7 +9,6 @@ import time
 import subprocess
 from collections import defaultdict
 
-# Track port hit rates for smart port prioritization
 port_hits = defaultdict(int)
 port_tries = defaultdict(int)
 
@@ -90,7 +89,6 @@ async def worker(q: asyncio.Queue, results: list):
             continue
         try:
             result = await test_one(ip, port)
-            if result:
-                results.append(result)
+            results.append(result)
         finally:
             q.task_done()

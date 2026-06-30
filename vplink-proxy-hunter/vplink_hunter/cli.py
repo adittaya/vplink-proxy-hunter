@@ -82,13 +82,12 @@ async def main_loop(args):
 
     render.t0 = time.time()
 
-    q = asyncio.Queue(maxsize=5000)
+    q = asyncio.Queue(maxsize=20000)
     e2_results = []
 
     pool = [asyncio.create_task(e2_worker(q, e2_results)) for _ in range(80)]
     render_task = asyncio.create_task(_render_loop())
 
-    cycle = 0
     try:
         while True:
             batch = gen_batch(2000)
@@ -100,34 +99,34 @@ async def main_loop(args):
             while e2_results:
                 cand = e2_results.pop(0)
                 stats["tested"] += 1
-                if cand:
-                    stats["http_ok"] += 1
-                    e2_entry = {
-                        "ip": cand["ip"],
-                        "port": cand["port"],
-                        "proto": "http",
-                        "latency": cand["latency"],
-                        "type": "unknown",
-                        "isp": cand.get("isp", ""),
-                        "country": cand.get("country", ""),
-                        "city": cand.get("city", ""),
-                        "region": cand.get("region", ""),
-                        "vplink_ok": False,
-                        "e2_ok": True,
-                    }
-                    sb.upsert_proxy(e2_entry)
-                    stats["saved_e2"] += 1
+                if not cand:
+                    continue
+                stats["http_ok"] += 1
+                e2_entry = {
+                    "ip": cand["ip"],
+                    "port": cand["port"],
+                    "proto": "http",
+                    "latency": cand["latency"],
+                    "type": "unknown",
+                    "isp": cand.get("isp", ""),
+                    "country": cand.get("country", ""),
+                    "city": cand.get("city", ""),
+                    "region": cand.get("region", ""),
+                    "vplink_ok": False,
+                    "e2_ok": True,
+                }
+                sb.upsert_proxy(e2_entry)
+                stats["saved_e2"] += 1
 
-                    verified = await e3_verify(cand, do_vplink=True)
-                    if verified:
-                        stats["verified"] += 1
-                        runners.append(verified)
-                        if verified["type"] == "residential":
-                            stats["residential"] += 1
-                        verified["e2_ok"] = True
-                        sb.upsert_proxy(verified)
+                verified = await e3_verify(cand, do_vplink=True)
+                if verified:
+                    stats["verified"] += 1
+                    runners.append(verified)
+                    if verified["type"] == "residential":
+                        stats["residential"] += 1
+                    verified["e2_ok"] = True
+                    sb.upsert_proxy(verified)
 
-            cycle += 1
             if args.once:
                 break
             await asyncio.sleep(0.05)
