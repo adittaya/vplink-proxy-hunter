@@ -5,7 +5,7 @@
 ## One-liner install
 
 ```bash
-curl -sL https://github.com/adittaya/vplink-proxy-hunter/raw/main/install.sh | bash
+git clone --depth 1 https://github.com/adittaya/vplink-proxy-hunter && cd vplink-proxy-hunter && bash install.sh
 ```
 
 ## Usage
