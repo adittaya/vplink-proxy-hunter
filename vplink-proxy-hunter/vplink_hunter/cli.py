@@ -173,7 +173,7 @@ async def main_loop(args):
     sb.init(conf["supabase_url"], conf["service_key"])
 
     SESSION_RESTART_AFTER = 20
-    run_verified = 0
+    stats["verified"] = 0
 
     # Bootstrap exact working IPs from DB
     try:
@@ -193,6 +193,8 @@ async def main_loop(args):
         pass
 
     render.t0 = time.time()
+    for k in ("generated", "tested", "http_ok", "saved_e2", "verified", "residential"):
+        stats[k] = 0
     stats["_stall_restart_at"] = time.time()
 
     q = asyncio.Queue(maxsize=15000)
@@ -301,11 +303,8 @@ async def main_loop(args):
                         subnets = {f"{ip.split('.')[0]}.{ip.split('.')[1]}" for ip in known_ips}
                         set_biased_subnets(subnets)
 
-            if e3_verified_event.is_set():
-                e3_verified_event.clear()
-                run_verified += 1
-            if run_verified >= SESSION_RESTART_AFTER:
-                sys.stderr.write(f"[restart] {run_verified} verified — clean restart\n")
+            if stats["verified"] >= SESSION_RESTART_AFTER:
+                sys.stderr.write(f"[restart] {stats['verified']} verified — clean restart\n")
                 _restart_flag = True
                 break
 
