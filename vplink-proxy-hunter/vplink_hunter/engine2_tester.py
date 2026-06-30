@@ -28,7 +28,7 @@ async def test_one(ip: str, port: int) -> dict | None:
     reader = writer = None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=2.5
+            asyncio.open_connection(ip, port), timeout=4
         )
     except asyncio.TimeoutError:
         return None
@@ -39,10 +39,10 @@ async def test_one(ip: str, port: int) -> dict | None:
 
     try:
         writer.write(_HTTP_GET_TPL.encode())
-        await asyncio.wait_for(writer.drain(), timeout=2)
+        await asyncio.wait_for(writer.drain(), timeout=3)
 
         response = b""
-        deadline = time.time() + 5.5
+        deadline = time.time() + 5
         while time.time() < deadline:
             remaining = deadline - time.time()
             if remaining <= 0:
@@ -81,10 +81,6 @@ async def test_one(ip: str, port: int) -> dict | None:
     org = (data.get("org") or "").lower()
     ip_addr = data.get("ip", ip)
 
-    # Verify HTTPS CONNECT support — most real-world usage requires it
-    if not await _check_connect(ip, port):
-        return None
-
     port_hits[port] += 1
 
     return {
@@ -98,29 +94,6 @@ async def test_one(ip: str, port: int) -> dict | None:
         "region": data.get("region", ""),
         "org": org,
     }
-
-
-async def _check_connect(ip: str, port: int) -> bool:
-    """Quick CONNECT tunnel test — proxy must support HTTPS tunneling."""
-    connect_req = (
-        "CONNECT ipinfo.io:443 HTTP/1.1\r\n"
-        "Host: ipinfo.io:443\r\n"
-        "\r\n"
-    ).encode()
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=5
-        )
-        try:
-            writer.write(connect_req)
-            await asyncio.wait_for(writer.drain(), timeout=3)
-            resp = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
-            return resp.startswith(b"HTTP/1.1 200") or resp.startswith(b"HTTP/1.0 200")
-        finally:
-            writer.close()
-            await writer.wait_closed()
-    except Exception:
-        return False
 
 
 def best_ports(n: int = 10) -> list[int]:

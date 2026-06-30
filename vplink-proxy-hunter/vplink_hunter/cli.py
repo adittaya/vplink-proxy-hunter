@@ -117,19 +117,29 @@ async def e3_worker(e3_queue, stats, runners, e3_tracking):
 
 
 async def gen_worker(q, stats):
-    """Generate in batches of 10k. Stop at 10k, resume when drained."""
+    """Generate small batches, adapt to E2 drain rate."""
+    min_batch = 50
+    max_batch = 300
+    current_batch = 100
+    last_depth = 0
     while True:
         depth = q.qsize()
         stats["qdepth"] = depth
-        if depth >= 10000:
-            await asyncio.sleep(1)
+        # Adapt batch size: if queue growing, shrink; if draining, grow
+        if depth > last_depth + 10:
+            current_batch = max(min_batch, current_batch - 20)
+        elif depth < last_depth - 50:
+            current_batch = min(max_batch, current_batch + 20)
+        last_depth = depth
+
+        if depth >= 2000:
+            await asyncio.sleep(0.5)
             continue
-        batch_size = min(800, 10000 - depth)
-        batch = gen_batch(batch_size)
+        batch = gen_batch(current_batch)
         stats["generated"] += len(batch)
         for ip, port in batch:
-            await q.put((ip, port))
-        await asyncio.sleep(0.05)
+            await q.put_nowait((ip, port))
+        await asyncio.sleep(max(0.05, depth / 2000))
 
 
 async def db_stats_task(interval: int = 10):
@@ -206,8 +216,14 @@ async def main_loop(args):
     try:
         scraped = await scrape_lists()
         if scraped:
-            for ip, port in scraped:
+            sys.stderr.write(f"[boot] scraped {len(scraped)} proxies from lists\n")
+            # Rate-limit scraped proxies to avoid clogging queue
+            for i, (ip, port) in enumerate(scraped):
+                if q.qsize() >= 500:
+                    await asyncio.sleep(0.3)
                 await q.put((ip, port))
+                if i % 100 == 0:
+                    await asyncio.sleep(0.01)
             stats["generated"] += len(scraped)
 
         gen_task = asyncio.create_task(gen_worker(q, stats))
