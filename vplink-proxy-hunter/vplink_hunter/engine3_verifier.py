@@ -7,6 +7,7 @@ import asyncio
 import re
 import signal
 import subprocess
+import time
 
 # Track running curl processes so we can kill them on shutdown
 _curl_procs: set[asyncio.subprocess.Process] = set()
@@ -46,6 +47,7 @@ def cleanup_subprocesses():
 
 
 VPLINK_TEST_URL = "https://vplink.in/UbpV2D"
+DOWNLOAD_TEST_URL = "https://www.google.com/favicon.ico"
 VPN_DETECTED_PATTERNS = re.compile(
     r"vpn\s*detected|proxy\s*detected|access\s*denied|blocked|"
     r"your\s*ip\s*has\s*been|suspicious\s*activity",
@@ -114,13 +116,25 @@ async def check_vplink(ip: str, port: int, timeout: float = 10.0) -> dict:
     return {"ok": False, "detail": "unknown_pattern"}
 
 
+async def check_download(ip: str, port: int, timeout: float = 8.0) -> dict:
+    """Download a small file through proxy to verify real traffic routing."""
+    proxy_url = f"http://{ip}:{port}"
+    t0 = time.time()
+    text = await _curl_get(DOWNLOAD_TEST_URL, proxy_url, timeout=int(timeout))
+    elapsed = round((time.time() - t0) * 1000)
+    if text and len(text) >= 1024:
+        return {"ok": True, "size_bytes": len(text), "latency_ms": elapsed}
+    return {"ok": False, "size_bytes": len(text or ""), "latency_ms": elapsed}
+
+
 def classify(org: str) -> str:
     return "datacenter" if DATACENTER_ORGS.search(org.lower()) else "residential"
 
 
-async def verify(candidate: dict, do_vplink: bool = True) -> dict | None:
+async def verify(candidate: dict, do_vplink: bool = True, do_download: bool = True) -> dict | None:
     """Engine 3: verify candidate → return dict or None."""
     vplink_result = {"ok": False, "detail": "skipped"}
+    download_result = {"ok": True, "size_bytes": 0, "latency_ms": 0}
 
     if do_vplink:
         vplink_result = await check_vplink(candidate["ip"], candidate["port"])
@@ -128,6 +142,11 @@ async def verify(candidate: dict, do_vplink: bool = True) -> dict | None:
             return None
     else:
         vplink_result["ok"] = True
+
+    if do_download:
+        download_result = await check_download(candidate["ip"], candidate["port"])
+        if not download_result["ok"]:
+            return None
 
     proxy_type = classify(candidate.get("org", ""))
 
