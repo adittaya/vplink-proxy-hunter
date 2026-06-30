@@ -1,14 +1,21 @@
+import sys
 from supabase import create_client, Client
 
 _client = None
 
 
+def _log(msg):
+    sys.stderr.write(f"[supabase] {msg}\n")
+    sys.stderr.flush()
+
+
 def init(url: str, key: str) -> Client:
     global _client
     if not url or not key:
-        print("  [!] Supabase init: missing url or key")
+        _log("missing url or key")
         return None
     _client = create_client(url, key)
+    _log(f"initialized: url={url[:30]}... key={key[:20]}...")
     return _client
 
 
@@ -18,7 +25,7 @@ def get() -> Client:
 
 def upsert_proxy(proxy: dict):
     if not _client:
-        print("  [!] upsert: client not initialized")
+        _log("client not initialized")
         return
     row = {
         "ip": proxy["ip"],
@@ -40,7 +47,7 @@ def upsert_proxy(proxy: dict):
             on_conflict="ip,port",
         ).execute()
     except Exception as e:
-        print(f"  [!] upsert error: {e}")
+        _log(f"upsert error: {e}")
 
 
 def get_proxy(ip: str, port: int) -> dict | None:
