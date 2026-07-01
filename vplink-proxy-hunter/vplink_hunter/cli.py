@@ -96,6 +96,10 @@ async def e3_worker(e3_queue, stats, runners, e3_tracking, restart_event, alread
         except asyncio.CancelledError:
             break
         try:
+            # Re-check already_verified (race: same proxy enqueued twice)
+            if (cand["ip"], cand["port"]) in already_verified:
+                e3_tracking["completed"] = e3_tracking.get("completed", 0) + 1
+                continue
             verified = await e3_verify(cand, do_vplink=True)
             if verified and verified["type"] == "residential":
                 already_verified.add((cand["ip"], cand["port"]))
