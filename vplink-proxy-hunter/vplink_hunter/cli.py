@@ -7,6 +7,7 @@ auto-restart, port prioritization, stale cleanup."""
 
 import argparse
 import asyncio
+import multiprocessing
 import os
 import sys
 import time
@@ -15,9 +16,9 @@ from datetime import datetime, timedelta, timezone
 
 from . import config as cfg
 from . import supabase_client as sb
-from .engine1_generator import batch as gen_batch, scrape_lists, set_biased_ports, set_biased_subnets, set_working_ips
+from .engine1_generator import batch as gen_batch, scrape_lists, set_biased_ports, set_biased_subnets, set_working_ips, get_biased_ports
 from .engine2_tester import worker as e2_worker, best_ports
-from .engine3_verifier import verify as e3_verify, cleanup_subprocesses as e3_cleanup
+from .engine3_verifier import verify as e3_verify, cleanup_subprocesses as e3_cleanup, classify as e3_classify
 
 
 def c(s, code=0):
@@ -25,7 +26,7 @@ def c(s, code=0):
 
 
 stats = dict(generated=0, tested=0, open_port=0, http_ok=0,
-             residential=0, verified=0, saved_e2=0, qdepth=0)
+             residential=0, verified=0, qdepth=0)
 db_totals = dict(total=0, e2_ok=0, vplink_ok=0, residential=0)
 runners = []
 def render():
@@ -54,7 +55,7 @@ def render():
         ("SESSION", "GEN", stats["generated"]),
         ("SESSION", "TEST", stats["tested"]),
         ("SESSION", "HTTP", stats["http_ok"]),
-        ("SESSION", "SAVED", stats["saved_e2"]),
+
         ("SESSION", "E3_OK", stats["verified"]),
     ]
     for label, key, val in rows:
@@ -84,7 +85,7 @@ def render():
     sys.stdout.flush()
 
 
-async def e3_worker(e3_queue, stats, runners, e3_tracking, restart_event):
+async def e3_worker(e3_queue, stats, runners, e3_tracking, restart_event, already_verified):
     while True:
         got_item = False
         try:
@@ -96,11 +97,11 @@ async def e3_worker(e3_queue, stats, runners, e3_tracking, restart_event):
             break
         try:
             verified = await e3_verify(cand, do_vplink=True)
-            if verified:
+            if verified and verified["type"] == "residential":
+                already_verified.add((cand["ip"], cand["port"]))
                 stats["verified"] += 1
+                stats["residential"] += 1
                 runners.append(verified)
-                if verified["type"] == "residential":
-                    stats["residential"] += 1
                 verified["e2_ok"] = True
                 await sb.async_upsert_proxy(verified)
                 if stats["verified"] % 20 == 0:
@@ -116,7 +117,7 @@ async def e3_worker(e3_queue, stats, runners, e3_tracking, restart_event):
 
 
 async def gen_worker(q, stats):
-    """Match E2 throughput — target 500 in queue, small steady batches."""
+    """Match E2 throughput — target 500 IPs in queue, small steady batches."""
     TARGET = 500
     while True:
         depth = q.qsize()
@@ -127,8 +128,8 @@ async def gen_worker(q, stats):
             continue
         batch = gen_batch(min(gap, 50))
         stats["generated"] += len(batch)
-        for ip, port in batch:
-            await q.put((ip, port))
+        for ip in batch:
+            await q.put(ip)
         await asyncio.sleep(0.1)
 
 
@@ -166,6 +167,48 @@ async def stale_cleanup_task(interval: int = 300):
         await asyncio.sleep(interval)
 
 
+async def reverify_task(interval: int = 120):
+    """Re-check existing VPLINK-verified proxies — delete if they lost internet."""
+    await asyncio.sleep(interval)
+    while True:
+        try:
+            db = sb.get()
+            if not db:
+                await asyncio.sleep(interval)
+                continue
+            rows = db.table("proxy_results").select("ip,port").eq("vplink_ok", True).execute()
+            rows = rows.data or []
+            if not rows:
+                await asyncio.sleep(interval)
+                continue
+            import concurrent.futures
+            from .engine3_verifier import check_download
+
+            async def _check_one(row: dict) -> tuple[str, int, bool]:
+                try:
+                    r = await check_download(row["ip"], row["port"], timeout=25)
+                    return (row["ip"], row["port"], r["ok"])
+                except Exception:
+                    return (row["ip"], row["port"], False)
+
+            tasks = [_check_one(r) for r in rows]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            dead = []
+            for r in results:
+                if isinstance(r, tuple) and not r[2]:
+                    dead.append((r[0], r[1]))
+            if dead:
+                for ip, port in dead:
+                    db.table("proxy_results").delete().eq("ip", ip).eq("port", port).execute()
+                sys.stderr.write(f"[reverify] {len(dead)} proxies lost internet — deleted\n")
+                counts = sb.get_counts()
+                if counts:
+                    db_totals.update(counts)
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+
+
 async def main_loop(args) -> bool:
     """Run one session. Returns True if caller should restart."""
     conf = cfg.get()
@@ -175,12 +218,21 @@ async def main_loop(args) -> bool:
     SESSION_RESTART_AFTER = 20
     stats["verified"] = 0
 
-    # Bootstrap exact working IPs from DB
+    # Bootstrap exact working IPs + already-verified from DB
     try:
         known_ips = sb.get_working_ips()
         if known_ips:
             set_working_ips(known_ips)
             sys.stderr.write(f"[boot] loaded {len(known_ips)} working IPs from DB\n")
+        verified_list = sb.list_proxies(vplink_only=True)
+        if verified_list:
+            for p in verified_list:
+                already_verified.add((p["ip"], p["port"]))
+            sys.stderr.write(f"[boot] {len(already_verified)} already-verified proxies in skip set\n")
+        # Re-classify existing DB records with updated CIDR + org detection
+        upd, d = sb.reclassify_all(e3_classify)
+        if upd or d:
+            sys.stderr.write(f"[boot] re-classified: {upd} updated, {d} datacenter deleted\n")
     except Exception:
         pass
 
@@ -193,11 +245,11 @@ async def main_loop(args) -> bool:
         pass
 
     render.t0 = time.time()
-    for k in ("generated", "tested", "http_ok", "saved_e2", "verified", "residential"):
+    for k in ("generated", "tested", "http_ok", "verified", "residential"):
         stats[k] = 0
     stats["_stall_restart_at"] = time.time()
 
-    q = asyncio.Queue(maxsize=15000)
+    q = asyncio.Queue(maxsize=10000)
     e2_results = deque()
     e3_queue = asyncio.Queue()
     e2_event = asyncio.Event()
@@ -205,10 +257,11 @@ async def main_loop(args) -> bool:
     e3_verified_event = asyncio.Event()
     known_ips: list[str] = []
     ip_last_hit: dict[str, float] = {}
+    already_verified: set[tuple[str, int]] = set()
 
     e2_pool = [asyncio.create_task(e2_worker(q, e2_results, e2_event))
-               for _ in range(80)]
-    e3_pool = [asyncio.create_task(e3_worker(e3_queue, stats, runners, e3_tracking, e3_verified_event))
+               for _ in range(60)]
+    e3_pool = [asyncio.create_task(e3_worker(e3_queue, stats, runners, e3_tracking, e3_verified_event, already_verified))
                for _ in range(max(1, args.e3_concurrency))]
     render_task = asyncio.create_task(_render_loop())
 
@@ -216,13 +269,17 @@ async def main_loop(args) -> bool:
     try:
         scraped = await scrape_lists()
         if scraped:
-            sys.stderr.write(f"[boot] scraped {len(scraped)} proxies from lists\n")
+            seen_ips = set()
             for ip, port in scraped:
-                await q.put((ip, port))
-            stats["generated"] += len(scraped)
+                if ip not in seen_ips:
+                    seen_ips.add(ip)
+                    await q.put(ip)
+            sys.stderr.write(f"[boot] scraped {len(scraped)} proxies → {len(seen_ips)} unique IPs\n")
+            stats["generated"] += len(seen_ips)
 
         gen_task = asyncio.create_task(gen_worker(q, stats))
         cleanup_task = asyncio.create_task(stale_cleanup_task())
+        reverify_task_handle = asyncio.create_task(reverify_task())
         db_stats_task_handle = asyncio.create_task(db_stats_task(interval=10))
 
         last_port_rebalance = time.time()
@@ -250,31 +307,15 @@ async def main_loop(args) -> bool:
                     continue
                 stats["http_ok"] += 1
 
-                # Preserve existing vplink_ok/type from DB — don't erase E3 results
-                existing = await sb.async_get_proxy(cand["ip"], cand["port"])
-                existing_vplink = existing.get("vplink_ok", False) if existing else False
-                existing_type = existing.get("type", "unknown") if existing else "unknown"
+                # Skip E3 if already verified this session
+                key = (cand["ip"], cand["port"])
+                if key in already_verified:
+                    continue
 
-                e2_entry = {
-                    "ip": cand["ip"],
-                    "port": cand["port"],
-                    "proto": "http",
-                    "latency": cand["latency"],
-                    "type": existing_type,
-                    "isp": cand.get("isp", ""),
-                    "country": cand.get("country", ""),
-                    "city": cand.get("city", ""),
-                    "region": cand.get("region", ""),
-                    "vplink_ok": existing_vplink,
-                    "e2_ok": True,
-                }
-                await sb.async_upsert_proxy(e2_entry)
-                stats["saved_e2"] += 1
-                # Track exact IP for generator bias (skip datacenter)
-                if existing_type != "datacenter":
-                    if cand["ip"] not in known_ips:
-                        known_ips.append(cand["ip"])
-                    ip_last_hit[cand["ip"]] = time.time()
+                # Track exact IP for generator bias
+                if cand["ip"] not in known_ips:
+                    known_ips.append(cand["ip"])
+                ip_last_hit[cand["ip"]] = time.time()
                 e3_tracking["enqueued"] += 1
                 e3_queue.put_nowait(cand)
 
@@ -306,7 +347,7 @@ async def main_loop(args) -> bool:
                 if good:
                     set_biased_ports(good)
                 # Prune known IPs with no hit in 10 min or DC-classified
-                stale_cutoff = now - 600
+                stale_cutoff = now - 300
                 prune_ips = sb.get_dc_ips()
                 known_ips = [ip for ip in known_ips
                              if ip not in prune_ips and ip_last_hit.get(ip, 0) >= stale_cutoff]
@@ -315,8 +356,8 @@ async def main_loop(args) -> bool:
                 set_working_ips(known_ips)
                 if known_ips:
                     if len(known_ips) >= 3:
-                        # Also add /16 subnets from clustered IPs for exploration
-                        subnets = {f"{ip.split('.')[0]}.{ip.split('.')[1]}" for ip in known_ips}
+                        # Explore neighbor IPs in same /24 for sister proxies
+                        subnets = {f"{ip.split('.')[0]}.{ip.split('.')[1]}.{ip.split('.')[2]}" for ip in known_ips}
                         set_biased_subnets(subnets)
 
             if e3_verified_event.is_set():
@@ -339,6 +380,8 @@ async def main_loop(args) -> bool:
         render_task.cancel()
         if cleanup_task:
             cleanup_task.cancel()
+        if reverify_task_handle:
+            reverify_task_handle.cancel()
         if db_stats_task_handle:
             db_stats_task_handle.cancel()
         e3_cleanup()
@@ -349,6 +392,8 @@ async def main_loop(args) -> bool:
             tasks_to_gather.append(gen_task)
         if cleanup_task:
             tasks_to_gather.append(cleanup_task)
+        if reverify_task_handle:
+            tasks_to_gather.append(reverify_task_handle)
         if db_stats_task_handle:
             tasks_to_gather.append(db_stats_task_handle)
         await asyncio.gather(*tasks_to_gather, return_exceptions=True)
@@ -429,7 +474,8 @@ def cmd_delete(args):
         print(f"  [!] Failed to delete {args.ip}:{args.port}")
 
 
-def _run(args):
+def _run_session(args):
+    """Run one scan session (blocking, with dashboard)."""
     while True:
         try:
             should = asyncio.run(main_loop(args))
@@ -440,9 +486,34 @@ def _run(args):
             time.sleep(3)
             continue
         if should:
-            sys.stderr.write("[restart] starting new session\n")
             continue
         break
+
+
+def _run_background(args, session_id):
+    """Run a silent background session (no dashboard output)."""
+    sys.stderr = open("/dev/null", "w")
+    _run_session(args)
+
+
+def _run(args):
+    n = getattr(args, "sessions", 1)
+    if n <= 1:
+        _run_session(args)
+        return
+
+    procs = []
+    for i in range(n - 1):
+        p = multiprocessing.Process(target=_run_background, args=(args, i), daemon=True)
+        p.start()
+        procs.append(p)
+    try:
+        _run_session(args)
+    except KeyboardInterrupt:
+        for p in procs:
+            p.terminate()
+        for p in procs:
+            p.join()
 
 
 def main():
@@ -464,6 +535,8 @@ def main():
     parser.add_argument("--gen-api-key", action="store_true", help="Generate/reset API key for proxy API")
     parser.add_argument("--e3-concurrency", type=int, default=5,
                         help="Concurrent E3 (VPLINK) verifications (default: 5)")
+    parser.add_argument("--sessions", type=int, default=1,
+                        help="Number of parallel scan sessions (default: 1)")
     args = parser.parse_args()
 
     if args.reset_config:

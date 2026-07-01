@@ -219,3 +219,37 @@ async def async_get_subnets() -> set[str]:
 async def async_get_proxy(ip: str, port: int) -> dict | None:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, functools.partial(get_proxy, ip, port))
+
+
+def reclassify_all(classify_fn):
+    """Re-check all DB records using a classify(ip, org) function.
+    
+    Classify_fn takes (ip, org) and returns 'residential' or 'datacenter'.
+    Records that change type are updated; datacenter records are deleted.
+    Returns (updated, deleted).
+    """
+    if not _client:
+        return (0, 0)
+    try:
+        resp = _client.table("proxy_results").select("ip,port,type,isp").execute()
+        rows = resp.data or []
+    except Exception:
+        return (0, 0)
+
+    updated = 0
+    deleted = 0
+    for row in rows:
+        new_type = classify_fn(row["ip"], row.get("isp", ""))
+        if new_type == "datacenter":
+            try:
+                _client.table("proxy_results").delete().eq("ip", row["ip"]).eq("port", row["port"]).execute()
+                deleted += 1
+            except Exception:
+                pass
+        elif new_type != row.get("type"):
+            try:
+                _client.table("proxy_results").update({"type": new_type}).eq("ip", row["ip"]).eq("port", row["port"]).execute()
+                updated += 1
+            except Exception:
+                pass
+    return (updated, deleted)

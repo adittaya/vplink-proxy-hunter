@@ -9,29 +9,10 @@ import re
 import subprocess
 
 PROXY_PORTS = [
-    80, 81, 443, 8080, 8081, 8443,
-    3128, 3129, 3130,
-    8888, 8889, 8899,
-    9999, 9000, 9001, 9100,
-    8000, 8001, 8008,
-    1080, 1081, 10801,
-    8118, 8181,
-    9090, 9091,
-    3690, 4145, 6588,
-    10000, 10001, 11223,
-    23652, 23756, 25461,
-    27112, 28073,
-    33333, 34445, 35555,
-    36666, 37777, 38888,
-    39999, 40000, 41114,
-    42222, 43333, 44444,
-    45555, 46666, 47777,
-    48888, 49999, 50000,
-    51111, 52222, 53333,
-    54444, 55555, 56666,
-    57777, 58888, 59999,
-    60000, 61111, 62222,
-    63333, 64444, 65535,
+    80, 8080, 3128, 8888, 1080,
+    8081, 8443, 8000, 8118, 9090,
+    9999, 9000, 1081, 3129, 8899,
+    8008, 8181, 9091, 808,
 ]
 
 RES_FIRST_OCTETS = [
@@ -65,11 +46,11 @@ def set_biased_subnets(subnets: set[str]):
         pool = []
         for s in subnets:
             parts = s.split(".")
-            if len(parts) == 2:
+            if len(parts) == 3:
                 try:
-                    a, b = int(parts[0]), int(parts[1])
-                    if a in RES_FIRST_OCTETS and 0 <= b <= 255:
-                        pool.append((a, b, None, None))
+                    a, b, c = int(parts[0]), int(parts[1]), int(parts[2])
+                    if a in RES_FIRST_OCTETS and 0 <= b <= 255 and 0 <= c <= 255:
+                        pool.append((a, b, c, None))
                 except ValueError:
                     pass
         _biased_subnet_pool = pool if pool else None
@@ -133,52 +114,36 @@ def set_biased_ports(ports: list[int]):
     _biased_ports = ports
 
 
+def get_biased_ports() -> list[int]:
+    return _biased_ports if _biased_ports else PROXY_PORTS
+
+
 def _blocked_ip(ip: str) -> bool:
     return any(ip.startswith(prefix) for prefix in BLOCKED_SUBNETS)
 
 
 def generate_ip() -> str:
     while True:
-        # 60% from exact known-working IPs (try different ports/siblings)
-        if _working_ips and random.random() < 0.6:
+        # 70% from exact known-working IPs (try different ports/siblings)
+        if _working_ips and random.random() < 0.7:
             ip = random.choice(_working_ips)
             if not _blocked_ip(ip):
                 return ip
-        # 30% from known /16 subnets
-        if _biased_subnet_pool and random.random() < 0.3:
-            a, b, _, _ = random.choice(_biased_subnet_pool)
+        # 20% from known /24 subnets (fix first 3 octets, random host)
+        if _biased_subnet_pool and random.random() < 0.2:
+            a, b, c, _ = random.choice(_biased_subnet_pool)
         else:
             a = random.choice(RES_FIRST_OCTETS)
             b = random.randint(0, 255)
-        c = random.randint(0, 255)
+            c = random.randint(0, 255)
         d = random.randint(2, 253)
         ip = f"{a}.{b}.{c}.{d}"
         if not _blocked_ip(ip):
             return ip
 
 
-_known_ip_port_idx: dict[str, int] = {}
-
-
-def generate_port(ip: str = "") -> int:
-    """Cycle ports in order for known IPs, random for unknown."""
-    ports = _biased_ports if _biased_ports else PROXY_PORTS
-    if ip in _working_ips:
-        idx = _known_ip_port_idx.get(ip, 0)
-        _known_ip_port_idx[ip] = (idx + 1) % len(ports)
-        return ports[idx]
-    return random.choice(ports)
-
-
-def generate() -> tuple:
-    ip = generate_ip()
-    port = generate_port(ip)
-    return ip, port
-
-
-def reset_port_cycle():
-    global _known_ip_port_idx
-    _known_ip_port_idx = {}
+def generate() -> str:
+    return generate_ip()
 
 
 def batch(count: int = 2000) -> list:
