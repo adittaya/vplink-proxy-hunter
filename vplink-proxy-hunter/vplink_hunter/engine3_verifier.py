@@ -1,17 +1,16 @@
 """Engine 3 — VPLINK Verifier + Residential Detector.
 
-Uses curl via subprocess for reliable CONNECT tunnel + TLS handling.
-Avoids httpx proxy configuration incompatibilities across versions.
+httpx async through proxy (singular kwarg for 0.28+).
 Three-layer classification: CIDR ranges → org regex → fresh lookup."""
 
 import asyncio
 import ipaddress
 import json
 import re
-import subprocess
 import time
 
-_curl_procs: set[asyncio.subprocess.Process] = set()
+import httpx
+
 
 DATACENTER_ORGS = re.compile(
     r"alibaba|amazon|google|hetzner|ovh|digitalocean|vultr|"
@@ -40,7 +39,6 @@ DATACENTER_ORGS = re.compile(
 )
 
 DATACENTER_CIDRS = [
-    # AWS
     ipaddress.IPv4Network("13.32.0.0/12", strict=False),
     ipaddress.IPv4Network("13.64.0.0/11", strict=False),
     ipaddress.IPv4Network("15.64.0.0/10", strict=False),
@@ -51,18 +49,15 @@ DATACENTER_CIDRS = [
     ipaddress.IPv4Network("44.192.0.0/10", strict=False),
     ipaddress.IPv4Network("52.0.0.0/10", strict=False),
     ipaddress.IPv4Network("54.0.0.0/9", strict=False),
-    # Google Cloud
     ipaddress.IPv4Network("34.0.0.0/10", strict=False),
     ipaddress.IPv4Network("35.184.0.0/13", strict=False),
     ipaddress.IPv4Network("35.208.0.0/12", strict=False),
     ipaddress.IPv4Network("35.224.0.0/12", strict=False),
     ipaddress.IPv4Network("8.34.0.0/15", strict=False),
-    # Azure
     ipaddress.IPv4Network("13.64.0.0/11", strict=False),
     ipaddress.IPv4Network("20.0.0.0/8", strict=False),
     ipaddress.IPv4Network("40.64.0.0/10", strict=False),
     ipaddress.IPv4Network("52.128.0.0/10", strict=False),
-    # DigitalOcean
     ipaddress.IPv4Network("64.225.0.0/16", strict=False),
     ipaddress.IPv4Network("104.248.0.0/16", strict=False),
     ipaddress.IPv4Network("138.197.0.0/16", strict=False),
@@ -78,7 +73,6 @@ DATACENTER_CIDRS = [
     ipaddress.IPv4Network("178.128.0.0/16", strict=False),
     ipaddress.IPv4Network("188.166.0.0/16", strict=False),
     ipaddress.IPv4Network("206.81.0.0/16", strict=False),
-    # Vultr
     ipaddress.IPv4Network("45.32.0.0/15", strict=False),
     ipaddress.IPv4Network("45.63.0.0/16", strict=False),
     ipaddress.IPv4Network("45.76.0.0/16", strict=False),
@@ -94,7 +88,6 @@ DATACENTER_CIDRS = [
     ipaddress.IPv4Network("192.248.0.0/16", strict=False),
     ipaddress.IPv4Network("207.148.0.0/16", strict=False),
     ipaddress.IPv4Network("209.222.0.0/15", strict=False),
-    # Linode
     ipaddress.IPv4Network("45.33.0.0/16", strict=False),
     ipaddress.IPv4Network("45.56.0.0/15", strict=False),
     ipaddress.IPv4Network("45.79.0.0/16", strict=False),
@@ -111,7 +104,6 @@ DATACENTER_CIDRS = [
     ipaddress.IPv4Network("192.155.0.0/16", strict=False),
     ipaddress.IPv4Network("192.81.128.0/21", strict=False),
     ipaddress.IPv4Network("198.58.0.0/15", strict=False),
-    # OVH
     ipaddress.IPv4Network("46.105.0.0/16", strict=False),
     ipaddress.IPv4Network("51.68.0.0/16", strict=False),
     ipaddress.IPv4Network("51.75.0.0/16", strict=False),
@@ -135,7 +127,6 @@ DATACENTER_CIDRS = [
     ipaddress.IPv4Network("192.95.0.0/16", strict=False),
     ipaddress.IPv4Network("198.27.0.0/16", strict=False),
     ipaddress.IPv4Network("213.251.0.0/16", strict=False),
-    # Hetzner
     ipaddress.IPv4Network("5.9.0.0/16", strict=False),
     ipaddress.IPv4Network("23.88.0.0/16", strict=False),
     ipaddress.IPv4Network("46.4.0.0/16", strict=False),
@@ -167,7 +158,6 @@ DATACENTER_CIDRS = [
     ipaddress.IPv4Network("188.40.0.0/16", strict=False),
     ipaddress.IPv4Network("195.201.0.0/16", strict=False),
     ipaddress.IPv4Network("213.133.0.0/16", strict=False),
-    # Alibaba / Aliyun
     ipaddress.IPv4Network("8.208.0.0/12", strict=False),
     ipaddress.IPv4Network("8.208.0.0/15", strict=False),
     ipaddress.IPv4Network("8.210.0.0/15", strict=False),
@@ -194,10 +184,9 @@ DATACENTER_CIDRS = [
     ipaddress.IPv4Network("161.117.0.0/16", strict=False),
     ipaddress.IPv4Network("163.230.0.0/16", strict=False),
     ipaddress.IPv4Network("170.33.0.0/16", strict=False),
-    ipaddress.IPv4Network("172.16.0.0/12", strict=False),  # Alibaba VPCs externally
+    ipaddress.IPv4Network("172.16.0.0/12", strict=False),
     ipaddress.IPv4Network("185.154.0.0/16", strict=False),
     ipaddress.IPv4Network("203.119.0.0/16", strict=False),
-    # Tencent Cloud
     ipaddress.IPv4Network("1.12.0.0/14", strict=False),
     ipaddress.IPv4Network("9.0.0.0/8", strict=False),
     ipaddress.IPv4Network("43.128.0.0/10", strict=False),
@@ -232,7 +221,6 @@ DATACENTER_CIDRS = [
     ipaddress.IPv4Network("190.92.0.0/16", strict=False),
     ipaddress.IPv4Network("193.112.0.0/16", strict=False),
     ipaddress.IPv4Network("211.159.0.0/16", strict=False),
-    # Oracle Cloud
     ipaddress.IPv4Network("129.146.0.0/17", strict=False),
     ipaddress.IPv4Network("130.61.0.0/16", strict=False),
     ipaddress.IPv4Network("132.145.0.0/16", strict=False),
@@ -260,44 +248,27 @@ DATACENTER_CIDRS = [
     ipaddress.IPv4Network("195.128.0.0/16", strict=False),
     ipaddress.IPv4Network("209.90.0.0/16", strict=False),
     ipaddress.IPv4Network("213.32.0.0/16", strict=False),
-    # Hetzner / Netcup specific
     ipaddress.IPv4Network("194.59.204.0/24", strict=False),
     ipaddress.IPv4Network("144.76.0.0/16", strict=False),
     ipaddress.IPv4Network("46.38.0.0/16", strict=False),
-    # Naver Cloud
     ipaddress.IPv4Network("106.10.0.0/15", strict=False),
     ipaddress.IPv4Network("119.207.0.0/16", strict=False),
     ipaddress.IPv4Network("175.196.0.0/15", strict=False),
     ipaddress.IPv4Network("175.206.0.0/15", strict=False),
     ipaddress.IPv4Network("222.100.0.0/15", strict=False),
-    # Webair
     ipaddress.IPv4Network("174.137.134.0/24", strict=False),
     ipaddress.IPv4Network("216.38.0.0/15", strict=False),
     ipaddress.IPv4Network("69.42.0.0/16", strict=False),
     ipaddress.IPv4Network("38.117.0.0/16", strict=False),
-    # AEZA / GLOBAL CONNECTIVITY / Port Networks
     ipaddress.IPv4Network("138.124.0.0/16", strict=False),
     ipaddress.IPv4Network("85.234.0.0/16", strict=False),
     ipaddress.IPv4Network("62.133.0.0/16", strict=False),
     ipaddress.IPv4Network("205.215.0.0/16", strict=False),
-    # Timeweb
     ipaddress.IPv4Network("94.198.0.0/16", strict=False),
     ipaddress.IPv4Network("185.71.0.0/16", strict=False),
 ]
 
-
-def cleanup_subprocesses():
-    for proc in list(_curl_procs):
-        if proc.returncode is None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    _curl_procs.clear()
-
-
 VPLINK_TEST_URL = "https://vplink.in/UbpV2D"
-DOWNLOAD_GIGA_URL = "https://speed.cloudflare.com/__down?bytes=10485760"
 VPN_DETECTED_PATTERNS = re.compile(
     r"vpn\s*detected|proxy\s*detected|access\s*denied|blocked|"
     r"your\s*ip\s*has\s*been|suspicious\s*activity",
@@ -308,68 +279,104 @@ WORKING_PATTERNS = re.compile(
     r"window\.location|Continue",
 )
 
+_HTTPX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36"
+}
 
-async def _curl_get(url: str, proxy: str, timeout: int = 12) -> str | None:
-    cmd = [
-        "curl", "-sL", "--max-time", str(timeout),
-        "-x", proxy,
-        url,
-    ]
-    proc = None
+
+def cleanup_subprocesses():
+    pass
+
+
+async def _http_get(ip: str, port: int, host: str, path: str, timeout: float = 6) -> str | None:
+    """HTTP GET through proxy via raw asyncio socket."""
+    reader = writer = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=min(timeout, 3)
         )
-        _curl_procs.add(proc)
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 2)
-        if proc.returncode != 0 or not out:
+        req = f"GET http://{host}{path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+        writer.write(req.encode())
+        await asyncio.wait_for(writer.drain(), timeout=min(timeout, 3))
+
+        response = b""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            chunk = await asyncio.wait_for(reader.read(65536), timeout=2)
+            if not chunk:
+                break
+            response += chunk
+        if not response:
             return None
-        return out.decode(errors="replace")
+        header_end = response.index(b"\r\n\r\n")
+        body = response[header_end + 4:]
+        return body.decode(errors="replace")
     except Exception:
         return None
     finally:
-        if proc:
-            _curl_procs.discard(proc)
-            if proc.returncode is None:
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except Exception:
-                    pass
+        if writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 async def check_vplink(ip: str, port: int, timeout: float = 10.0) -> dict:
+    """Test proxy against VPLINK via httpx through the proxy."""
     proxy_url = f"http://{ip}:{port}"
-    text = await _curl_get(VPLINK_TEST_URL, proxy_url, timeout=int(timeout))
-
-    if text is None:
-        return {"ok": False, "detail": "curl_failed"}
+    try:
+        async with httpx.AsyncClient(
+            proxy=proxy_url,
+            timeout=httpx.Timeout(timeout, connect=5.0),
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(VPLINK_TEST_URL, headers=_HTTPX_HEADERS)
+            text = resp.text
+    except httpx.ConnectError:
+        return {"ok": False, "detail": "connect_failed"}
+    except httpx.TimeoutException:
+        return {"ok": False, "detail": "timeout"}
+    except httpx.ProxyError:
+        return {"ok": False, "detail": "proxy_error"}
+    except Exception:
+        return {"ok": False, "detail": "unknown"}
 
     if not text:
         return {"ok": False, "detail": "empty_response"}
 
     if VPN_DETECTED_PATTERNS.search(text):
         return {"ok": False, "detail": "vpn_detected"}
-
     if WORKING_PATTERNS.search(text) or len(text) > 500:
         return {"ok": True, "detail": "passed"}
-
     if len(text) < 200:
         return {"ok": False, "detail": "too_short"}
-
     return {"ok": False, "detail": "unknown_pattern"}
 
 
 async def check_download(ip: str, port: int, timeout: float = 25.0) -> dict:
-    """Download a 10MB test file through the proxy. Requires ≥8MB to pass."""
-    proxy_url = f"http://{ip}:{port}"
     t0 = time.time()
-    text = await _curl_get(DOWNLOAD_GIGA_URL, proxy_url, timeout=int(timeout))
-    elapsed = round((time.time() - t0) * 1000)
-    size = len(text) if text else 0
-    if text and size >= 8_000_000:
-        return {"ok": True, "size_bytes": size, "latency_ms": elapsed}
-    return {"ok": False, "size_bytes": size, "latency_ms": elapsed}
+    proxy_url = f"http://{ip}:{port}"
+    try:
+        async with httpx.AsyncClient(
+            proxy=proxy_url,
+            timeout=httpx.Timeout(timeout, connect=5.0),
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(
+                "https://speed.cloudflare.com/__down?bytes=10485760",
+                headers=_HTTPX_HEADERS,
+            )
+            elapsed = round((time.time() - t0) * 1000)
+            size = len(resp.content)
+            if size >= 8_000_000:
+                return {"ok": True, "size_bytes": size, "latency_ms": elapsed}
+            return {"ok": False, "size_bytes": size, "latency_ms": elapsed}
+    except Exception:
+        elapsed = round((time.time() - t0) * 1000)
+        return {"ok": False, "size_bytes": 0, "latency_ms": elapsed}
 
 
 def _ip_in_dc_cidr(ip_str: str) -> bool:
@@ -379,20 +386,11 @@ def _ip_in_dc_cidr(ip_str: str) -> bool:
             if ip in net:
                 return True
     except ValueError:
-        return False
+        pass
     return False
 
 
 def classify(ip: str | None = None, org: str | None = None) -> str:
-    """Three-layer classification: CIDR → org regex.
-    
-    Args:
-        ip: Proxy IP (checked against known datacenter CIDR ranges).
-        org: ISP/Organization name (checked against DATACENTER_ORGS regex).
-    
-    Returns:
-        "datacenter" or "residential"
-    """
     if ip and _ip_in_dc_cidr(ip):
         return "datacenter"
     if org and DATACENTER_ORGS.search(org.lower()):
@@ -401,9 +399,7 @@ def classify(ip: str | None = None, org: str | None = None) -> str:
 
 
 async def _get_org_via_proxy(ip: str, port: int) -> str | None:
-    """Fetch org data through the proxy using ipinfo.io (fresh lookup)."""
-    proxy_url = f"http://{ip}:{port}"
-    text = await _curl_get("http://ipinfo.io/json", proxy_url, timeout=8)
+    text = await _http_get(ip, port, "ipinfo.io", "/json", timeout=8)
     if not text:
         return None
     try:
@@ -413,20 +409,14 @@ async def _get_org_via_proxy(ip: str, port: int) -> str | None:
         return None
 
 
-async def verify(candidate: dict, do_vplink: bool = True, do_download: bool = True) -> dict | None:
-    """Engine 3: verify candidate → return dict or None.
-    
-    Flow:
-    1. Classify candidate by IP (CIDR) and org (regex) — reject datacenter early.
-    2. Run VPLINK test — reject if fail.
-    3. Re-fetch org through proxy (fresh ipinfo.io lookup) — re-classify.
-    4. Run download test — reject if fail.
-    """
+async def verify(candidate: dict, do_vplink: bool = True, do_download: bool = False,
+                 fail_counts: dict | None = None) -> dict | None:
     proxy_ip = candidate["ip"]
     proxy_org = candidate.get("org", "")
 
-    # Layer 1: classify by IP CIDR + org regex
     if classify(ip=proxy_ip, org=proxy_org) == "datacenter":
+        if fail_counts is not None:
+            fail_counts["dc_classify_initial"] = fail_counts.get("dc_classify_initial", 0) + 1
         return None
 
     vplink_result = {"ok": False, "detail": "skipped"}
@@ -434,24 +424,33 @@ async def verify(candidate: dict, do_vplink: bool = True, do_download: bool = Tr
     if do_vplink:
         vplink_result = await check_vplink(proxy_ip, candidate["port"])
         if not vplink_result["ok"]:
+            if fail_counts is not None:
+                reason = f"vplink_{vplink_result.get('detail', 'fail')}"
+                fail_counts[reason] = fail_counts.get(reason, 0) + 1
             return None
     else:
         vplink_result["ok"] = True
 
-    # Layer 2: fresh org lookup through proxy (catches proxies where E2's
-    # ipinfo lookup was stale/blocked/empty)
     fresh_org = await _get_org_via_proxy(proxy_ip, candidate["port"])
     if fresh_org is not None:
         if classify(ip=proxy_ip, org=fresh_org) == "datacenter":
+            if fail_counts is not None:
+                fail_counts["dc_fresh_org"] = fail_counts.get("dc_fresh_org", 0) + 1
             return None
         proxy_org = fresh_org
     else:
         if classify(ip=proxy_ip) == "datacenter":
+            if fail_counts is not None:
+                fail_counts["dc_no_org"] = fail_counts.get("dc_no_org", 0) + 1
             return None
+        if fail_counts is not None:
+            fail_counts["org_fetch_failed"] = fail_counts.get("org_fetch_failed", 0) + 1
 
     if do_download:
         download_result = await check_download(proxy_ip, candidate["port"])
         if not download_result["ok"]:
+            if fail_counts is not None:
+                fail_counts["download_fail"] = fail_counts.get("download_fail", 0) + 1
             return None
 
     proxy_type = classify(ip=proxy_ip, org=proxy_org)

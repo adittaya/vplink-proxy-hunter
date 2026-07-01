@@ -4,11 +4,13 @@ Raw asyncio socket HTTP through proxy.
 Concurrent port scanning per IP — tests all 19 ports at once."""
 
 import asyncio
+import ipaddress
 import json
+import socket
 import time
 from collections import defaultdict
 
-from .engine1_generator import PROXY_PORTS, get_biased_ports
+from .engine3_verifier import DATACENTER_CIDRS
 
 port_hits = defaultdict(int)
 port_tries = defaultdict(int)
@@ -24,28 +26,49 @@ _HTTP_GET_TPL = (
 )
 
 
+async def _connect(ip: str, port: int, timeout: float = 0.5) -> tuple | None:
+    loop = asyncio.get_running_loop()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_SYNCNT, 2)
+    except (OSError, AttributeError):
+        pass
+    sock.setblocking(False)
+    try:
+        await asyncio.wait_for(
+            loop.sock_connect(sock, (ip, port)), timeout=timeout
+        )
+        reader, writer = await asyncio.open_connection(sock=sock)
+        return reader, writer
+    except Exception:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return None
+
+
 async def _check_https_connect(ip: str, port: int) -> bool:
     """Quick check: can this proxy establish an HTTPS CONNECT tunnel?"""
-    reader = writer = None
+    conn = await _connect(ip, port, timeout=0.5)
+    if conn is None:
+        return False
+    reader, writer = conn
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=2
-        )
         writer.write(
             b"CONNECT httpbin.org:443 HTTP/1.1\r\n"
             b"Host: httpbin.org:443\r\n"
             b"Connection: close\r\n\r\n"
         )
-        await asyncio.wait_for(writer.drain(), timeout=2)
-        resp = await asyncio.wait_for(reader.read(256), timeout=2)
+        await asyncio.wait_for(writer.drain(), timeout=1)
+        resp = await asyncio.wait_for(reader.read(256), timeout=1)
         return b"200" in resp
     except Exception:
         return False
     finally:
         try:
-            if writer:
-                writer.close()
-                await writer.wait_closed()
+            writer.close()
+            await writer.wait_closed()
         except Exception:
             pass
 
@@ -54,19 +77,14 @@ async def test_one(ip: str, port: int) -> dict | None:
     t0 = time.time()
     port_tries[port] += 1
 
-    # Pre-check: HTTPS CONNECT (filter out HTTP-only proxies early)
     if not await _check_https_connect(ip, port):
         return None
 
-    reader = writer = None
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=2
-        )
-    except (asyncio.TimeoutError, OSError, Exception):
+    conn = await _connect(ip, port, timeout=0.5)
+    if conn is None:
         return None
+    reader, writer = conn
 
-    # Use cached ipinfo data if available (same IP, different port)
     if ip in _ipinfo_cache:
         data = _ipinfo_cache[ip]
         latency = round((time.time() - t0) * 1000)
@@ -85,16 +103,16 @@ async def test_one(ip: str, port: int) -> dict | None:
 
     try:
         writer.write(_HTTP_GET_TPL.encode())
-        await asyncio.wait_for(writer.drain(), timeout=2)
+        await asyncio.wait_for(writer.drain(), timeout=1)
 
         response = b""
-        deadline = time.time() + 3
+        deadline = time.time() + 1
         while time.time() < deadline:
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
             chunk = await asyncio.wait_for(
-                reader.read(4096), timeout=min(remaining, 1.5)
+                reader.read(4096), timeout=min(remaining, 0.5)
             )
             if not chunk:
                 break
@@ -102,11 +120,15 @@ async def test_one(ip: str, port: int) -> dict | None:
     except (asyncio.TimeoutError, Exception):
         return None
     finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
+        if writer:
+            try:
+                writer.close()
+            except Exception:
+                pass
+            try:
+                await writer.wait_closed()
+            except (Exception, asyncio.CancelledError):
+                pass
 
     try:
         header_end = response.index(b"\r\n\r\n")
@@ -148,49 +170,38 @@ def best_ports(n: int = 10) -> list[int]:
     return [p for p, _ in scored[:n]]
 
 
-async def test_ip(ip: str) -> list[dict]:
-    """Test all ports concurrently, poll with FIRST_COMPLETED, cancel remaining early.
+def _ip_in_dc_cidr(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.IPv4Address(ip_str)
+        for net in DATACENTER_CIDRS:
+            if ip in net:
+                return True
+    except ValueError:
+        pass
+    return False
 
-    Working IPs found in ~2-4s (fastest port succeeds). Dead IPs abandoned in ~3-5s
-    instead of waiting for all 19 port-level timeouts (up to 12s)."""
-    ports = get_biased_ports()
-    tasks = {asyncio.create_task(test_one(ip, port)): port for port in ports}
-    working: list[dict] = []
-    deadline = time.time() + 12
-    pending = set(tasks.keys())
 
-    while pending and time.time() < deadline:
-        remaining = max(deadline - time.time(), 0.1)
-        done, pending = await asyncio.wait(
-            pending, timeout=min(remaining, 0.5),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for t in done:
-            r = t.result()
-            if r:
-                working.append(r)
-        if len(working) >= 3:
-            break
-
-    for t in pending:
-        t.cancel()
-    return working
+async def test_ip(ip: str, primary_port: int) -> dict | None:
+    if _ip_in_dc_cidr(ip):
+        return None
+    return await test_one(ip, primary_port)
 
 
 async def worker(q: asyncio.Queue, results: list, ready_event: asyncio.Event):
-    """Consume IP from queue, test all ports concurrently, append results."""
+    """Consume (ip, port) from queue, test the port, append result if working."""
     while True:
         got_item = False
         try:
-            ip = await asyncio.wait_for(q.get(), timeout=1)
+            ip_port = await asyncio.wait_for(q.get(), timeout=1)
             got_item = True
         except asyncio.TimeoutError:
             continue
         except asyncio.CancelledError:
             break
         try:
-            working = await test_ip(ip)
-            for result in working:
+            ip, port = ip_port
+            result = await test_ip(ip, port)
+            if result:
                 results.append(result)
                 ready_event.set()
         except asyncio.CancelledError:
