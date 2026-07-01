@@ -7,6 +7,7 @@ import asyncio
 import random
 import re
 import subprocess
+import time
 
 PROXY_PORTS = [
     80, 8080, 3128, 8888, 1080,
@@ -36,6 +37,7 @@ RES_FIRST_OCTETS = [
 _biased_subnets: set[str] | None = None
 _biased_subnet_pool: list[tuple[int, int, int, int]] | None = None
 _working_ips: list[str] = []
+_ip_last_generated: dict[str, float] = {}
 
 
 def set_biased_subnets(subnets: set[str]):
@@ -124,11 +126,15 @@ def _blocked_ip(ip: str) -> bool:
 
 def generate_ip() -> str:
     while True:
-        # 70% from exact known-working IPs (try different ports/siblings)
+        # 70% from exact known-working IPs — skip if tested within last 120s
         if _working_ips and random.random() < 0.7:
-            ip = random.choice(_working_ips)
-            if not _blocked_ip(ip):
-                return ip
+            pool = [ip for ip in _working_ips
+                    if time.time() - _ip_last_generated.get(ip, 0) > 120]
+            if pool:
+                ip = random.choice(pool)
+                if not _blocked_ip(ip):
+                    _ip_last_generated[ip] = time.time()
+                    return ip
         # 20% from known /24 subnets (fix first 3 octets, random host)
         if _biased_subnet_pool and random.random() < 0.2:
             a, b, c, _ = random.choice(_biased_subnet_pool)

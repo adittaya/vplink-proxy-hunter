@@ -251,7 +251,7 @@ async def main_loop(args) -> bool:
 
     q = asyncio.Queue(maxsize=10000)
     e2_results = deque()
-    e3_queue = asyncio.Queue()
+    e3_queue = asyncio.Queue(maxsize=500)
     e2_event = asyncio.Event()
     e3_tracking = {"enqueued": 0, "completed": 0}
     e3_verified_event = asyncio.Event()
@@ -316,8 +316,13 @@ async def main_loop(args) -> bool:
                 if cand["ip"] not in known_ips:
                     known_ips.append(cand["ip"])
                 ip_last_hit[cand["ip"]] = time.time()
-                e3_tracking["enqueued"] += 1
-                e3_queue.put_nowait(cand)
+
+                # Drop if E3 queue is full (backpressure) — prevents hours-long backlog
+                try:
+                    e3_queue.put_nowait(cand)
+                    e3_tracking["enqueued"] += 1
+                except asyncio.QueueFull:
+                    pass
 
                 # Check restart immediately after each result
                 if e3_verified_event.is_set():
