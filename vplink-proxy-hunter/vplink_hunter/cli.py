@@ -221,11 +221,15 @@ async def main_loop(args) -> bool:
     should_restart = False
     SESSION_RESTART_AFTER = 20
     stats["verified"] = 0
+    known_ips: list[str] = []
+    ip_last_hit: dict[str, float] = {}
+    already_verified: set[tuple[str, int]] = set()
 
     # Bootstrap exact working IPs + already-verified from DB
     try:
-        known_ips = sb.get_working_ips()
-        if known_ips:
+        db_ips = sb.get_working_ips()
+        if db_ips:
+            known_ips = list(db_ips)
             set_working_ips(known_ips)
             sys.stderr.write(f"[boot] loaded {len(known_ips)} working IPs from DB\n")
         verified_list = sb.list_proxies(vplink_only=True)
@@ -233,12 +237,14 @@ async def main_loop(args) -> bool:
             for p in verified_list:
                 already_verified.add((p["ip"], p["port"]))
             sys.stderr.write(f"[boot] {len(already_verified)} already-verified proxies in skip set\n")
+        else:
+            sys.stderr.write(f"[boot] 0 already-verified proxies found in DB\n")
         # Re-classify existing DB records with updated CIDR + org detection
         upd, d = sb.reclassify_all(e3_classify)
         if upd or d:
             sys.stderr.write(f"[boot] re-classified: {upd} updated, {d} datacenter deleted\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        sys.stderr.write(f"[boot] bootstrap error: {exc}\n")
 
     # Immediate DB totals fetch (don't wait for background task)
     try:
@@ -259,9 +265,6 @@ async def main_loop(args) -> bool:
     e2_event = asyncio.Event()
     e3_tracking = {"enqueued": 0, "completed": 0}
     e3_verified_event = asyncio.Event()
-    known_ips: list[str] = []
-    ip_last_hit: dict[str, float] = {}
-    already_verified: set[tuple[str, int]] = set()
 
     e2_pool = [asyncio.create_task(e2_worker(q, e2_results, e2_event))
                for _ in range(60)]
