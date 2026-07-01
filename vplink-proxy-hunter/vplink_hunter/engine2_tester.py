@@ -154,14 +154,15 @@ async def test_ip(ip: str) -> list[dict]:
     Working IPs found in ~2-4s (fastest port succeeds). Dead IPs abandoned in ~3-5s
     instead of waiting for all 19 port-level timeouts (up to 12s)."""
     ports = get_biased_ports()
-    pending = {asyncio.create_task(test_one(ip, port)): port for port in ports}
+    tasks = {asyncio.create_task(test_one(ip, port)): port for port in ports}
     working: list[dict] = []
     deadline = time.time() + 12
+    pending = set(tasks.keys())
 
     while pending and time.time() < deadline:
         remaining = max(deadline - time.time(), 0.1)
         done, pending = await asyncio.wait(
-            pending.keys(), timeout=min(remaining, 0.5),
+            pending, timeout=min(remaining, 0.5),
             return_when=asyncio.FIRST_COMPLETED,
         )
         for t in done:
