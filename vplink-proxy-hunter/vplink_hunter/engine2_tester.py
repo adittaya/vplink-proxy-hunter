@@ -29,7 +29,7 @@ async def _check_https_connect(ip: str, port: int) -> bool:
     reader = writer = None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=3
+            asyncio.open_connection(ip, port), timeout=2
         )
         writer.write(
             b"CONNECT httpbin.org:443 HTTP/1.1\r\n"
@@ -37,7 +37,7 @@ async def _check_https_connect(ip: str, port: int) -> bool:
             b"Connection: close\r\n\r\n"
         )
         await asyncio.wait_for(writer.drain(), timeout=2)
-        resp = await asyncio.wait_for(reader.read(256), timeout=3)
+        resp = await asyncio.wait_for(reader.read(256), timeout=2)
         return b"200" in resp
     except Exception:
         return False
@@ -61,7 +61,7 @@ async def test_one(ip: str, port: int) -> dict | None:
     reader = writer = None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=3
+            asyncio.open_connection(ip, port), timeout=2
         )
     except (asyncio.TimeoutError, OSError, Exception):
         return None
@@ -88,13 +88,13 @@ async def test_one(ip: str, port: int) -> dict | None:
         await asyncio.wait_for(writer.drain(), timeout=2)
 
         response = b""
-        deadline = time.time() + 4
+        deadline = time.time() + 3
         while time.time() < deadline:
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
             chunk = await asyncio.wait_for(
-                reader.read(4096), timeout=min(remaining, 2)
+                reader.read(4096), timeout=min(remaining, 1.5)
             )
             if not chunk:
                 break
@@ -149,16 +149,31 @@ def best_ports(n: int = 10) -> list[int]:
 
 
 async def test_ip(ip: str) -> list[dict]:
-    """Test all ports for an IP concurrently, return all working results."""
+    """Test all ports concurrently, poll with FIRST_COMPLETED, cancel remaining early.
+
+    Working IPs found in ~2-4s (fastest port succeeds). Dead IPs abandoned in ~3-5s
+    instead of waiting for all 19 port-level timeouts (up to 12s)."""
     ports = get_biased_ports()
-    tasks = [asyncio.create_task(test_one(ip, port)) for port in ports]
-    done, _ = await asyncio.wait(tasks, timeout=15, return_when=asyncio.ALL_COMPLETED)
-    results = []
-    for t in done:
-        r = t.result()
-        if r:
-            results.append(r)
-    return results
+    pending = {asyncio.create_task(test_one(ip, port)): port for port in ports}
+    working: list[dict] = []
+    deadline = time.time() + 12
+
+    while pending and time.time() < deadline:
+        remaining = max(deadline - time.time(), 0.1)
+        done, pending = await asyncio.wait(
+            pending.keys(), timeout=min(remaining, 0.5),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in done:
+            r = t.result()
+            if r:
+                working.append(r)
+        if len(working) >= 3:
+            break
+
+    for t in pending:
+        t.cancel()
+    return working
 
 
 async def worker(q: asyncio.Queue, results: list, ready_event: asyncio.Event):
