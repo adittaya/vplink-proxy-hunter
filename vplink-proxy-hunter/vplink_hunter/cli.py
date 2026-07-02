@@ -81,60 +81,44 @@ async def _render_loop():
 
 
 async def gen_worker(q, stats, e2_tested_at, source_for_ip):
-    """Re-scrape proxy lists when queue runs low or every 20 min.
+    """Background batch generator: scrape 10K, enqueue, loop.
 
-    Every 20 minutes the queue is cleared and a fresh scrape starts,
-    so old/stale proxies are discarded rather than slowly trickling through.
-    Tracks which source each IP came from for quality scoring."""
-    MIN_REFILL = 1000
-    E2_RE_TEST_INTERVAL = 900
-    RESTART_CYCLE = 1200  # 20 minutes
-    cycle_start = time.time()
+    Scraping takes ~20-30s per batch while E2 workers consume the
+    previous batch — no waiting for queue to drain."""
+    BATCH_SIZE = 10000
+    E2_RE_TEST_INTERVAL = 300
     while True:
-        depth = q.qsize()
-        stats["qdepth"] = depth
-        now = time.time()
-        cycle_elapsed = now - cycle_start
-
-        if cycle_elapsed >= RESTART_CYCLE:
-            # Drain stale queue and start fresh
-            for _ in range(q.qsize()):
-                try:
-                    q.get_nowait()
-                except Exception:
-                    break
-            source_for_ip.clear()
-            stats["generated"] = 0
-            cycle_start = now
-            proxies = await scrape_lists()
-        elif depth >= MIN_REFILL:
-            await asyncio.sleep(1)
+        stats["qdepth"] = q.qsize()
+        proxies = await scrape_lists()
+        if not proxies:
+            await asyncio.sleep(5)
             continue
-        else:
-            proxies = await scrape_lists()
 
-        if proxies:
-            local_seen: set[tuple[str, int]] = set()
-            count = 0
-            for item in proxies:
-                ip, port = item[0], item[1]
-                source = item[2] if len(item) >= 3 else "unknown"
-                ip_port = (ip, port)
-                if ip_port in local_seen:
-                    continue
-                local_seen.add(ip_port)
-                if now - e2_tested_at.get(ip, 0) < E2_RE_TEST_INTERVAL:
-                    continue
-                if _ip_in_dc_cidr(ip):
-                    continue
-                try:
-                    q.put_nowait(ip_port)
-                    source_for_ip[ip_port] = source
-                    count += 1
-                except asyncio.QueueFull:
-                    break
-            stats["generated"] += count
-        await asyncio.sleep(10)
+        local_seen: set[tuple[str, int]] = set()
+        count = 0
+        now = time.time()
+        for item in proxies:
+            ip, port = item[0], item[1]
+            source = item[2] if len(item) >= 3 else "unknown"
+            ip_port = (ip, port)
+            if ip_port in local_seen:
+                continue
+            local_seen.add(ip_port)
+            if now - e2_tested_at.get(ip, 0) < E2_RE_TEST_INTERVAL:
+                continue
+            if _ip_in_dc_cidr(ip):
+                continue
+            try:
+                q.put_nowait(ip_port)
+                source_for_ip[ip_port] = source
+                count += 1
+            except asyncio.QueueFull:
+                break
+            if count >= BATCH_SIZE:
+                break
+
+        stats["generated"] += count
+        stats["qdepth"] = q.qsize()
 
 
 async def e3_worker(e3_queue, already_verified, e3_in_flight):
@@ -219,27 +203,9 @@ async def main_loop(args):
     render_task = asyncio.create_task(_render_loop())
     db_poll = asyncio.create_task(db_poll_task(10))
 
-    gen_task = None
+    gen_task = asyncio.create_task(gen_worker(q, stats, e2_tested_at, source_for_ip))
+
     try:
-        # Initial scrape — fill the queue with (ip, port) tuples
-        proxies = await scrape_lists()
-        if proxies:
-            seen: set[tuple[str, int]] = set()
-            for item in proxies:
-                ip, port = item[0], item[1]
-                source = item[2] if len(item) >= 3 else "unknown"
-                ip_port = (ip, port)
-                if ip_port not in seen and not _ip_in_dc_cidr(ip):
-                    seen.add(ip_port)
-                    source_for_ip[ip_port] = source
-                    try:
-                        q.put_nowait(ip_port)
-                        stats["generated"] += 1
-                    except asyncio.QueueFull:
-                        break
-
-        gen_task = asyncio.create_task(gen_worker(q, stats, e2_tested_at, source_for_ip))
-
         while True:
             stats["qdepth"] = q.qsize()
             try:
@@ -254,7 +220,6 @@ async def main_loop(args):
                 e2_tested_at[cand["ip"]] = time.time()
                 if not cand:
                     continue
-                # Track source pass rate for quality scoring
                 key = (cand["ip"], cand["port"])
                 src = source_for_ip.pop(key, None)
                 if src:
@@ -272,9 +237,10 @@ async def main_loop(args):
                     pass
 
             if args.once:
-                all_e2_done = q.qsize() == 0 and not e2_results
-                all_e3_done = (e3_queue.qsize() == 0)
-                if all_e2_done and all_e3_done and stats["tested"] > 0:
+                q_empty = q.qsize() == 0
+                no_pending_e2 = not e2_results
+                no_pending_e3 = e3_queue.qsize() == 0
+                if q_empty and no_pending_e2 and no_pending_e3 and stats["tested"] > 0:
                     break
 
     except asyncio.CancelledError:
