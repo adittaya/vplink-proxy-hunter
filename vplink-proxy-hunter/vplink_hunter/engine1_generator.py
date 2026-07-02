@@ -48,10 +48,16 @@ PROXY_SOURCES = [
     ("ianlusule_http", "https://raw.githubusercontent.com/Ian-Lusule/Proxies/main/proxies/http.txt"),
     ("vpslabcloud_http", "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/http_all.txt"),
     ("clearproxy_http", "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/http/raw/all.txt"),
+    ("solispi_http", "https://raw.githubusercontent.com/SoliSpirit/proxy-list/main/http.txt"),
+    ("iplocate_http", "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/proxies/http/data.txt"),
 ]
 IP_RE = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*[:\s]\s*(\d+)")
 PROXYDB_RE = re.compile(r'href="/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d+)#(http|https)"')
 TOTAL_RE = re.compile(r"Showing \d+ to \d+ of (\d+) total")
+PROXYNOVA_RE = re.compile(
+    r'<abbr title="(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})">.*?</abbr></td>\s*<td>(\d+)</td>',
+    re.DOTALL,
+)
 
 # Source scoring — shared across the pipeline
 # Format: {"source_name": {"total": int, "passed": int}}
@@ -181,6 +187,58 @@ async def scrape_geonode(max_pages: int = 3) -> list[tuple[str, int, str]]:
     return results
 
 
+async def scrape_proxynova() -> list[tuple[str, int, str]]:
+    """Scrape ProxyNova HTML table."""
+    source = "proxynova"
+    results = []
+    text = await fetch_url("https://www.proxynova.com/proxy-server-list/", timeout=15)
+    if not text:
+        return results
+
+    seen = set()
+    for match in PROXYNOVA_RE.finditer(text):
+        ip, port_str = match.groups()
+        port = int(port_str)
+        key = (ip, port)
+        if key not in seen and not _blocked_ip(ip):
+            seen.add(key)
+            results.append((ip, port, source))
+
+    return results
+
+
+async def scrape_openproxy() -> list[tuple[str, int, str]]:
+    """Scrape OpenProxy.space JSON API."""
+    source = "openproxy"
+    results = []
+    text = await fetch_url("https://openproxy.space/api/proxies/HTTP", timeout=15)
+    if not text:
+        return results
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return results
+
+    raw_list = data.get("data", {}).get("HTTP", [])
+    seen = set()
+    for entry in raw_list:
+        parts = entry.split(":")
+        if len(parts) != 2:
+            continue
+        ip, port_str = parts
+        try:
+            port = int(port_str)
+        except ValueError:
+            continue
+        key = (ip, port)
+        if key not in seen and not _blocked_ip(ip):
+            seen.add(key)
+            results.append((ip, port, source))
+
+    return results
+
+
 async def scrape_lists() -> list[tuple[str, int, str]]:
     """Fetch from all sources, skip low-quality lists.
 
@@ -218,6 +276,22 @@ async def scrape_lists() -> list[tuple[str, int, str]]:
     if not should_skip_source("geonode"):
         gn = await scrape_geonode()
         for item in gn:
+            key = (item[0], item[1])
+            if key not in seen:
+                seen.add(key)
+                proxies.append(item)
+
+    if not should_skip_source("proxynova"):
+        pn = await scrape_proxynova()
+        for item in pn:
+            key = (item[0], item[1])
+            if key not in seen:
+                seen.add(key)
+                proxies.append(item)
+
+    if not should_skip_source("openproxy"):
+        op = await scrape_openproxy()
+        for item in op:
             key = (item[0], item[1])
             if key not in seen:
                 seen.add(key)
