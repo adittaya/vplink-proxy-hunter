@@ -11,7 +11,9 @@ from collections import deque
 
 from . import config as cfg
 from . import supabase_client as sb
-from .engine1_generator import scrape_lists
+from .engine1_generator import (
+    scrape_lists, SOURCE_STATS, record_source_result, source_pass_rate, should_skip_source,
+)
 from .engine2_tester import worker as e2_worker, _ip_in_dc_cidr
 from .engine3_verifier import verify as e3_verify, cleanup_subprocesses as e3_cleanup
 
@@ -78,11 +80,12 @@ async def _render_loop():
         await asyncio.sleep(0.5)
 
 
-async def gen_worker(q, stats, e2_tested_at):
+async def gen_worker(q, stats, e2_tested_at, source_for_ip):
     """Re-scrape proxy lists when queue runs low or every 20 min.
 
     Every 20 minutes the queue is cleared and a fresh scrape starts,
-    so old/stale proxies are discarded rather than slowly trickling through."""
+    so old/stale proxies are discarded rather than slowly trickling through.
+    Tracks which source each IP came from for quality scoring."""
     MIN_REFILL = 1000
     E2_RE_TEST_INTERVAL = 900
     RESTART_CYCLE = 1200  # 20 minutes
@@ -100,6 +103,7 @@ async def gen_worker(q, stats, e2_tested_at):
                     q.get_nowait()
                 except Exception:
                     break
+            source_for_ip.clear()
             stats["generated"] = 0
             cycle_start = now
             proxies = await scrape_lists()
@@ -112,7 +116,9 @@ async def gen_worker(q, stats, e2_tested_at):
         if proxies:
             local_seen: set[tuple[str, int]] = set()
             count = 0
-            for ip, port in proxies:
+            for item in proxies:
+                ip, port = item[0], item[1]
+                source = item[2] if len(item) >= 3 else "unknown"
                 ip_port = (ip, port)
                 if ip_port in local_seen:
                     continue
@@ -123,6 +129,7 @@ async def gen_worker(q, stats, e2_tested_at):
                     continue
                 try:
                     q.put_nowait(ip_port)
+                    source_for_ip[ip_port] = source
                     count += 1
                 except asyncio.QueueFull:
                     break
@@ -202,6 +209,8 @@ async def main_loop(args):
     e2_tested_at: dict[str, float] = {}
     e3_in_flight: set[tuple[str, int]] = set()
     e3_queue = asyncio.Queue(maxsize=500)
+    source_for_ip: dict[tuple[str, int], str] = {}
+    source_stats_report: dict[str, dict] = {}
 
     e2_pool = [asyncio.create_task(e2_worker(q, e2_results, e2_event))
                for _ in range(80)]
@@ -226,7 +235,7 @@ async def main_loop(args):
                     except asyncio.QueueFull:
                         break
 
-        gen_task = asyncio.create_task(gen_worker(q, stats, e2_tested_at))
+        gen_task = asyncio.create_task(gen_worker(q, stats, e2_tested_at, source_for_ip))
 
         while True:
             stats["qdepth"] = q.qsize()
@@ -242,8 +251,15 @@ async def main_loop(args):
                 e2_tested_at[cand["ip"]] = time.time()
                 if not cand:
                     continue
-                stats["http_ok"] += 1
+                # Track source pass rate for quality scoring
                 key = (cand["ip"], cand["port"])
+                src = source_for_ip.pop(key, None)
+                if src:
+                    src_total = source_stats_report.setdefault(src, {"total": 0, "passed": 0})
+                    src_total["total"] += 1
+                    src_total["passed"] += 1
+                    record_source_result(src, 1, 1)
+                stats["http_ok"] += 1
                 if key in already_verified or key in e3_in_flight:
                     continue
                 e3_in_flight.add(key)
@@ -319,13 +335,27 @@ def cmd_delete(args):
     print(f"  {'OK' if ok else 'FAIL'}: Deleted {args.ip}:{args.port}")
 
 
+def _print_source_report():
+    if not SOURCE_STATS:
+        return
+    sys.stderr.write("╔══════ Source Quality Report ══════════════════════════════╗\n")
+    for src in sorted(SOURCE_STATS.keys()):
+        s = SOURCE_STATS[src]
+        rate = s["passed"] / max(s["total"], 1) * 100
+        skip = " SKIP" if s["total"] >= 100 and rate < 5 else ""
+        sys.stderr.write(f"║  {src:<20} {s['passed']:>4}/{s['total']:<4} ({rate:5.1f}%){skip:<5} ║\n")
+    sys.stderr.write("╚══════════════════════════════════════════════════════════════╝\n")
+
+
 def _run_session(args):
     while True:
         try:
             asyncio.run(main_loop(args))
         except KeyboardInterrupt:
+            _print_source_report()
             break
         except Exception as exc:
+            _print_source_report()
             sys.stderr.write(f"[!] Crash: {exc}. Restarting in 3s...\n")
             time.sleep(3)
             continue

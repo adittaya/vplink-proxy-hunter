@@ -26,6 +26,25 @@ _HTTP_GET_TPL = (
 )
 
 
+async def _tcp_ping(ip: str, port: int, timeout: float = 0.3) -> bool:
+    """Lightning-fast TCP connect check — quick dead-IP filter."""
+    loop = asyncio.get_running_loop()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setblocking(False)
+    try:
+        await asyncio.wait_for(
+            loop.sock_connect(sock, (ip, port)), timeout=timeout
+        )
+        sock.close()
+        return True
+    except Exception:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return False
+
+
 async def _connect(ip: str, port: int, timeout: float = 0.5) -> tuple | None:
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -76,6 +95,9 @@ async def _check_https_connect(ip: str, port: int) -> bool:
 async def test_one(ip: str, port: int) -> dict | None:
     t0 = time.time()
     port_tries[port] += 1
+
+    if not await _tcp_ping(ip, port):
+        return None
 
     if not await _check_https_connect(ip, port):
         return None

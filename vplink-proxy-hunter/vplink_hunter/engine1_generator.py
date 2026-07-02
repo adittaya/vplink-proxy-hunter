@@ -1,6 +1,7 @@
-"""Engine 1 — Proxy List Scraper.
+"""Engine 1 — Proxy List Scraper with source scoring.
 
-Fetches fresh proxy candidates from quality public sources."""
+Fetches fresh proxy candidates from quality public sources.
+Tracks pass rate per source so low-quality lists get skipped automatically."""
 
 import asyncio
 import json
@@ -52,6 +53,34 @@ IP_RE = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*[:\s]\s*(\d+)")
 PROXYDB_RE = re.compile(r'href="/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d+)#(http|https)"')
 TOTAL_RE = re.compile(r"Showing \d+ to \d+ of (\d+) total")
 
+# Source scoring — shared across the pipeline
+# Format: {"source_name": {"total": int, "passed": int}}
+SOURCE_STATS: dict[str, dict] = {}
+MIN_PASS_RATE = 0.05
+MIN_SAMPLES = 100
+
+
+def should_skip_source(source: str) -> bool:
+    stats = SOURCE_STATS.get(source)
+    if not stats or stats["total"] < MIN_SAMPLES:
+        return False
+    rate = stats["passed"] / max(stats["total"], 1)
+    return rate < MIN_PASS_RATE
+
+
+def record_source_result(source: str, total: int, passed: int):
+    if source not in SOURCE_STATS:
+        SOURCE_STATS[source] = {"total": 0, "passed": 0}
+    SOURCE_STATS[source]["total"] += total
+    SOURCE_STATS[source]["passed"] += passed
+
+
+def source_pass_rate(source: str) -> str:
+    stats = SOURCE_STATS.get(source)
+    if not stats or stats["total"] == 0:
+        return "?/? (---)"
+    return f"{stats['passed']}/{stats['total']} ({stats['passed']/stats['total']*100:.0f}%)"
+
 
 def _blocked_ip(ip: str) -> bool:
     return any(ip.startswith(prefix) for prefix in BLOCKED_SUBNETS)
@@ -69,8 +98,9 @@ async def fetch_url(url: str, timeout: int = 10) -> str:
         return ""
 
 
-async def scrape_proxydb(max_pages: int = 10) -> list[tuple[str, int]]:
+async def scrape_proxydb(max_pages: int = 10) -> list[tuple[str, int, str]]:
     """Scrape proxydb.net with pagination, HTTP/HTTPS only."""
+    source = "proxydb"
     results = []
     base = "https://proxydb.net/?protocol=http&offset="
     first = await fetch_url(base + "0")
@@ -88,7 +118,7 @@ async def scrape_proxydb(max_pages: int = 10) -> list[tuple[str, int]]:
         key = (ip, port)
         if key not in seen and not _blocked_ip(ip):
             seen.add(key)
-            results.append((ip, port))
+            results.append((ip, port, source))
 
     for page in range(1, total_pages):
         await asyncio.sleep(0.5)
@@ -101,13 +131,14 @@ async def scrape_proxydb(max_pages: int = 10) -> list[tuple[str, int]]:
             key = (ip, port)
             if key not in seen and not _blocked_ip(ip):
                 seen.add(key)
-                results.append((ip, port))
+                results.append((ip, port, source))
 
     return results
 
 
-async def scrape_geonode(max_pages: int = 3) -> list[tuple[str, int]]:
+async def scrape_geonode(max_pages: int = 3) -> list[tuple[str, int, str]]:
     """Scrape geonode free proxy list via their public API."""
+    source = "geonode"
     results = []
     base = "https://proxylist.geonode.com/api/proxy-list?limit=500&sort_by=responseTime&sort_type=asc&page="
     text = await fetch_url(base + "1", timeout=15)
@@ -145,16 +176,22 @@ async def scrape_geonode(max_pages: int = 3) -> list[tuple[str, int]]:
             key = (ip, port)
             if key not in seen and not _blocked_ip(ip):
                 seen.add(key)
-                results.append((ip, port))
+                results.append((ip, port, source))
 
     return results
 
 
-async def scrape_lists() -> list[tuple[str, int]]:
+async def scrape_lists() -> list[tuple[str, int, str]]:
+    """Fetch from all sources, skip low-quality lists.
+
+    Returns (ip, port, source_name) tuples in source order
+    (newest/freshest first from each source)."""
     seen = set()
-    proxies = []
+    proxies: list[tuple[str, int, str]] = []
 
     async def fetch_source(name, url):
+        if should_skip_source(name):
+            return name, 0
         text = await fetch_url(url)
         found = 0
         for match in IP_RE.finditer(text):
@@ -163,25 +200,27 @@ async def scrape_lists() -> list[tuple[str, int]]:
             key = (ip, port)
             if key not in seen and not _blocked_ip(ip):
                 seen.add(key)
-                proxies.append((ip, port))
+                proxies.append((ip, port, name))
                 found += 1
         return name, found
 
     tasks = [fetch_source(name, url) for name, url in PROXY_SOURCES]
-    results = await asyncio.gather(*tasks)
+    await asyncio.gather(*tasks)
 
-    pd = await scrape_proxydb()
-    for ip, port in pd:
-        key = (ip, port)
-        if key not in seen and not _blocked_ip(ip):
-            seen.add(key)
-            proxies.append((ip, port))
+    if not should_skip_source("proxydb"):
+        pd = await scrape_proxydb()
+        for item in pd:
+            key = (item[0], item[1])
+            if key not in seen:
+                seen.add(key)
+                proxies.append(item)
 
-    gn = await scrape_geonode()
-    for ip, port in gn:
-        key = (ip, port)
-        if key not in seen and not _blocked_ip(ip):
-            seen.add(key)
-            proxies.append((ip, port))
+    if not should_skip_source("geonode"):
+        gn = await scrape_geonode()
+        for item in gn:
+            key = (item[0], item[1])
+            if key not in seen:
+                seen.add(key)
+                proxies.append(item)
 
     return proxies
