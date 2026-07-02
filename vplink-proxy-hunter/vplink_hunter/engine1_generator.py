@@ -3,6 +3,8 @@
 Fetches fresh proxy candidates from quality public sources."""
 
 import asyncio
+import json
+import random
 import re
 import subprocess
 
@@ -48,6 +50,8 @@ PROXY_SOURCES = [
     ("clearproxy_http", "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/http/raw/all.txt"),
 ]
 IP_RE = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*[:\s]\s*(\d+)")
+PROXYDB_RE = re.compile(r'href="/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d+)#(http|https)"')
+TOTAL_RE = re.compile(r"Showing \d+ to \d+ of (\d+) total")
 
 
 def _blocked_ip(ip: str) -> bool:
@@ -64,6 +68,87 @@ async def fetch_url(url: str, timeout: int = 10) -> str:
         return out.decode(errors="replace")
     except Exception:
         return ""
+
+
+async def scrape_proxydb(max_pages: int = 10) -> list[tuple[str, int]]:
+    """Scrape proxydb.net with pagination, HTTP/HTTPS only."""
+    results = []
+    base = "https://proxydb.net/?protocol=http&offset="
+    first = await fetch_url(base + "0")
+    if not first:
+        return results
+
+    total_match = TOTAL_RE.search(first)
+    total_proxies = int(total_match.group(1)) if total_match else 0
+    total_pages = min(max_pages, (total_proxies + 29) // 30)
+
+    seen = set()
+    for match in PROXYDB_RE.finditer(first):
+        ip, port_str, _ = match.groups()
+        port = int(port_str)
+        key = (ip, port)
+        if key not in seen and not _blocked_ip(ip):
+            seen.add(key)
+            results.append((ip, port))
+
+    for page in range(1, total_pages):
+        await asyncio.sleep(0.5)
+        text = await fetch_url(f"{base}{page * 30}")
+        if not text:
+            continue
+        for match in PROXYDB_RE.finditer(text):
+            ip, port_str, _ = match.groups()
+            port = int(port_str)
+            key = (ip, port)
+            if key not in seen and not _blocked_ip(ip):
+                seen.add(key)
+                results.append((ip, port))
+
+    return results
+
+
+async def scrape_geonode(max_pages: int = 3) -> list[tuple[str, int]]:
+    """Scrape geonode free proxy list via their public API."""
+    results = []
+    base = "https://proxylist.geonode.com/api/proxy-list?limit=500&sort_by=responseTime&sort_type=asc&page="
+    text = await fetch_url(base + "1", timeout=15)
+    if not text:
+        return results
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return results
+
+    total = data.get("total", 0)
+    total_pages = min(max_pages, (total + 499) // 500)
+
+    seen = set()
+    for page in range(1, total_pages + 1):
+        if page > 1:
+            await asyncio.sleep(0.3)
+            text = await fetch_url(f"{base}{page}", timeout=15)
+            if not text:
+                continue
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+
+        for proxy in data.get("data", []):
+            protocols = proxy.get("protocols", [])
+            if not any(p in protocols for p in ("http", "https")):
+                continue
+            ip = proxy.get("ip", "")
+            port = int(proxy.get("port", 0))
+            if port == 0:
+                continue
+            key = (ip, port)
+            if key not in seen and not _blocked_ip(ip):
+                seen.add(key)
+                results.append((ip, port))
+
+    return results
 
 
 async def scrape_lists() -> list[tuple[str, int]]:
@@ -86,4 +171,19 @@ async def scrape_lists() -> list[tuple[str, int]]:
     tasks = [fetch_source(name, url) for name, url in PROXY_SOURCES]
     results = await asyncio.gather(*tasks)
 
+    pd = await scrape_proxydb()
+    for ip, port in pd:
+        key = (ip, port)
+        if key not in seen and not _blocked_ip(ip):
+            seen.add(key)
+            proxies.append((ip, port))
+
+    gn = await scrape_geonode()
+    for ip, port in gn:
+        key = (ip, port)
+        if key not in seen and not _blocked_ip(ip):
+            seen.add(key)
+            proxies.append((ip, port))
+
+    random.shuffle(proxies)
     return proxies

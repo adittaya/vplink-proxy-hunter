@@ -356,7 +356,12 @@ async def check_vplink(ip: str, port: int, timeout: float = 10.0) -> dict:
     return {"ok": False, "detail": "unknown_pattern"}
 
 
-async def check_download(ip: str, port: int, timeout: float = 25.0) -> dict:
+MIN_SPEED_KBPS = 100
+IDEAL_SPEED_KBPS = 200
+DL_TARGET_BYTES = 1_048_576  # 1MB — enough to measure speed accurately
+
+
+async def check_download(ip: str, port: int, timeout: float = 20.0) -> dict:
     t0 = time.time()
     proxy_url = f"http://{ip}:{port}"
     try:
@@ -366,17 +371,26 @@ async def check_download(ip: str, port: int, timeout: float = 25.0) -> dict:
             follow_redirects=True,
         ) as client:
             resp = await client.get(
-                "https://speed.cloudflare.com/__down?bytes=10485760",
+                f"https://speed.cloudflare.com/__down?bytes={DL_TARGET_BYTES}",
                 headers=_HTTPX_HEADERS,
             )
-            elapsed = round((time.time() - t0) * 1000)
+            elapsed_s = time.time() - t0
             size = len(resp.content)
-            if size >= 8_000_000:
-                return {"ok": True, "size_bytes": size, "latency_ms": elapsed}
-            return {"ok": False, "size_bytes": size, "latency_ms": elapsed}
+            speed_kbps = round((size / 1024) / elapsed_s) if elapsed_s > 0 else 0
+            return {
+                "ok": speed_kbps >= MIN_SPEED_KBPS,
+                "size_bytes": size,
+                "latency_ms": round(elapsed_s * 1000),
+                "speed_kbps": speed_kbps,
+            }
     except Exception:
-        elapsed = round((time.time() - t0) * 1000)
-        return {"ok": False, "size_bytes": 0, "latency_ms": elapsed}
+        elapsed_s = time.time() - t0
+        return {
+            "ok": False,
+            "size_bytes": 0,
+            "latency_ms": round(elapsed_s * 1000),
+            "speed_kbps": 0,
+        }
 
 
 def _ip_in_dc_cidr(ip_str: str) -> bool:
@@ -409,7 +423,7 @@ async def _get_org_via_proxy(ip: str, port: int) -> str | None:
         return None
 
 
-async def verify(candidate: dict, do_vplink: bool = True, do_download: bool = False,
+async def verify(candidate: dict, do_vplink: bool = True,
                  fail_counts: dict | None = None) -> dict | None:
     proxy_ip = candidate["ip"]
     proxy_org = candidate.get("org", "")
@@ -446,12 +460,12 @@ async def verify(candidate: dict, do_vplink: bool = True, do_download: bool = Fa
         if fail_counts is not None:
             fail_counts["org_fetch_failed"] = fail_counts.get("org_fetch_failed", 0) + 1
 
-    if do_download:
-        download_result = await check_download(proxy_ip, candidate["port"])
-        if not download_result["ok"]:
-            if fail_counts is not None:
-                fail_counts["download_fail"] = fail_counts.get("download_fail", 0) + 1
-            return None
+    download_result = await check_download(proxy_ip, candidate["port"])
+    if not download_result["ok"]:
+        if fail_counts is not None:
+            speed = download_result.get("speed_kbps", 0)
+            fail_counts[f"download_slow_{speed}_kbps"] = fail_counts.get(f"download_slow_{speed}_kbps", 0) + 1
+        return None
 
     proxy_type = classify(ip=proxy_ip, org=proxy_org)
 
@@ -466,4 +480,5 @@ async def verify(candidate: dict, do_vplink: bool = True, do_download: bool = Fa
         "city": candidate.get("city", ""),
         "region": candidate.get("region", ""),
         "vplink_ok": vplink_result["ok"],
+        "speed_kbps": download_result.get("speed_kbps", 0),
     }
