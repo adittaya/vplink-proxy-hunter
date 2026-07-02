@@ -4,7 +4,6 @@ Fetches fresh proxy candidates from quality public sources."""
 
 import asyncio
 import json
-import random
 import re
 import subprocess
 
@@ -185,5 +184,4 @@ async def scrape_lists() -> list[tuple[str, int]]:
             seen.add(key)
             proxies.append((ip, port))
 
-    random.shuffle(proxies)
     return proxies

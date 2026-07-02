@@ -79,19 +79,38 @@ async def _render_loop():
 
 
 async def gen_worker(q, stats, e2_tested_at):
-    """Re-scrape proxy lists when queue runs low. Queues (ip, port) tuples."""
+    """Re-scrape proxy lists when queue runs low or every 20 min.
+
+    Every 20 minutes the queue is cleared and a fresh scrape starts,
+    so old/stale proxies are discarded rather than slowly trickling through."""
     MIN_REFILL = 1000
     E2_RE_TEST_INTERVAL = 900
+    RESTART_CYCLE = 1200  # 20 minutes
+    cycle_start = time.time()
     while True:
         depth = q.qsize()
         stats["qdepth"] = depth
-        if depth >= MIN_REFILL:
+        now = time.time()
+        cycle_elapsed = now - cycle_start
+
+        if cycle_elapsed >= RESTART_CYCLE:
+            # Drain stale queue and start fresh
+            for _ in range(q.qsize()):
+                try:
+                    q.get_nowait()
+                except Exception:
+                    break
+            stats["generated"] = 0
+            cycle_start = now
+            proxies = await scrape_lists()
+        elif depth >= MIN_REFILL:
             await asyncio.sleep(1)
             continue
-        proxies = await scrape_lists()
+        else:
+            proxies = await scrape_lists()
+
         if proxies:
             local_seen: set[tuple[str, int]] = set()
-            now = time.time()
             count = 0
             for ip, port in proxies:
                 ip_port = (ip, port)
