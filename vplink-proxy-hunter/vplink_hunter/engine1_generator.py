@@ -4,6 +4,7 @@ Fetches fresh proxy candidates from quality public sources.
 Tracks pass rate per source so low-quality lists get skipped automatically."""
 
 import asyncio
+import base64
 import json
 import re
 import subprocess
@@ -49,15 +50,100 @@ PROXY_SOURCES = [
     ("vpslabcloud_http", "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/http_all.txt"),
     ("clearproxy_http", "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/http/raw/all.txt"),
     ("solispi_http", "https://raw.githubusercontent.com/SoliSpirit/proxy-list/main/http.txt"),
-    ("iplocate_http", "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/proxies/http/data.txt"),
+    ("thespeedx_http", "https://raw.githubusercontent.com/TheSpeedX/proxy-list/master/http.txt"),
 ]
 IP_RE = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*[:\s]\s*(\d+)")
 PROXYDB_RE = re.compile(r'href="/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d+)#(http|https)"')
 TOTAL_RE = re.compile(r"Showing \d+ to \d+ of (\d+) total")
-PROXYNOVA_RE = re.compile(
-    r'<abbr title="(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})">.*?</abbr></td>\s*<td>(\d+)</td>',
-    re.DOTALL,
-)
+def _js_arith(expr: str) -> int:
+    expr = expr.strip()
+    m = re.match(r'(\d+)\s*([+-])\s*(\d+)', expr)
+    if m:
+        a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
+        return a + b if op == '+' else a - b
+    try:
+        return int(expr)
+    except ValueError:
+        return 0
+
+def _apply_methods(base: str, methods: str) -> str:
+    while methods:
+        m = re.match(r'\.substring\(([^,]+),\s*([^)]+)\)\s*(.*)', methods)
+        if m:
+            a, b = _js_arith(m.group(1)), _js_arith(m.group(2))
+            base = base[a:b]
+            methods = m.group(3).strip()
+            continue
+        m = re.match(r'\.repeat\((\d+)\)\s*(.*)', methods)
+        if m:
+            base = base * int(m.group(1))
+            methods = m.group(2).strip()
+            continue
+        m = re.match(r'\.split\(""\)\.reverse\(\)\.join\(""\)\s*(.*)', methods)
+        if m:
+            base = base[::-1]
+            methods = m.group(1).strip()
+            continue
+        m = re.match(r'\.concat\((.+)\)\s*(.*)', methods)
+        if m:
+            arg = m.group(1).strip()
+            if arg.startswith('"') and arg.endswith('"'):
+                base = base + arg[1:-1]
+            else:
+                base = base + _js_eval(arg)
+            methods = m.group(2).strip()
+            continue
+        break
+    return base
+
+
+def _js_eval(expr: str) -> str:
+    expr = expr.strip()
+    if expr.startswith('"') and expr.endswith('"'):
+        return expr[1:-1]
+    m = re.fullmatch(r'atob\("([^"]*)"\)', expr)
+    if m:
+        try:
+            return base64.b64decode(m.group(1)).decode()
+        except Exception:
+            return ""
+    m = re.fullmatch(
+        r'\[([^\]]+)\]\.map\(\(([^)]+)\)\s*=>\s*String\.fromCharCode\(([^)]+)\)\)\.join\(""\)',
+        expr,
+    )
+    if m:
+        codes = [int(x.strip()) for x in m.group(1).split(',')]
+        return ''.join(chr(c) for c in codes if 32 <= c <= 126)
+    m = re.match(r'("[^"]*")(.*)', expr)
+    if m:
+        return _apply_methods(m.group(1)[1:-1], m.group(2).strip())
+    m = re.match(r'\[([^\]]+)\](.*)', expr)
+    if m:
+        codes = [int(x.strip()) for x in m.group(1).split(',')]
+        base = ''.join(chr(c) for c in codes if 32 <= c <= 126)
+        return _apply_methods(base, m.group(2).strip())
+    return expr
+
+def _match_parens(text: str, start: int) -> int:
+    count = 1
+    for i in range(start, len(text)):
+        if text[i] == '(':
+            count += 1
+        elif text[i] == ')':
+            count -= 1
+            if count == 0:
+                return i
+    return -1
+
+
+def _valid_ip(ip: str) -> bool:
+    parts = ip.split('.')
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except ValueError:
+        return False
 
 # Source scoring — shared across the pipeline
 # Format: {"source_name": {"total": int, "passed": int}}
@@ -188,54 +274,90 @@ async def scrape_geonode(max_pages: int = 3) -> list[tuple[str, int, str]]:
 
 
 async def scrape_proxynova() -> list[tuple[str, int, str]]:
-    """Scrape ProxyNova HTML table."""
+    """Scrape ProxyNova HTML table with JS-obfuscated IPs.
+
+    ProxyNova obfuscates IPs with document.write() using patterns like:
+      atob(), .substring(), .repeat(), .split().reverse().join(), .map()."""
     source = "proxynova"
     results = []
     text = await fetch_url("https://www.proxynova.com/proxy-server-list/", timeout=15)
     if not text:
         return results
 
+    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', text, re.DOTALL)
     seen = set()
-    for match in PROXYNOVA_RE.finditer(text):
-        ip, port_str = match.groups()
-        port = int(port_str)
+    for row in rows:
+        tds = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
+        if len(tds) < 2:
+            continue
+        ip_cell, port_cell = tds[0], tds[1]
+        ip = None
+        m = re.search(
+            r'<abbr title="(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\.', ip_cell,
+        )
+        if m and _valid_ip(m.group(1)):
+            ip = m.group(1)
+        else:
+            dw_start = ip_cell.find("document.write(")
+            if dw_start >= 0:
+                paren = dw_start + len("document.write(")
+                end = _match_parens(ip_cell, paren)
+                if end >= 0:
+                    expr = ip_cell[paren:end]
+                    result = _js_eval(expr)
+                    for m2 in re.finditer(
+                        r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', result,
+                    ):
+                        if _valid_ip(m2.group(1)):
+                            ip = m2.group(1)
+                            break
+                    if not ip:
+                        for m2 in re.finditer(
+                            r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', expr,
+                        ):
+                            if _valid_ip(m2.group(1)):
+                                ip = m2.group(1)
+                                break
+        if not ip or _blocked_ip(ip):
+            continue
+        port_m = re.search(r'>(\d{2,5})<', port_cell)
+        if not port_m:
+            continue
+        port = int(port_m.group(1))
         key = (ip, port)
-        if key not in seen and not _blocked_ip(ip):
+        if key not in seen:
             seen.add(key)
             results.append((ip, port, source))
 
     return results
 
 
-async def scrape_openproxy() -> list[tuple[str, int, str]]:
-    """Scrape OpenProxy.space JSON API."""
-    source = "openproxy"
+async def scrape_fpln() -> list[tuple[str, int, str]]:
+    """Scrape free-proxy-list.net, us-proxy.org, sslproxies.org HTML tables.
+
+    These sites share the same table structure and list hundreds of proxies."""
+    source = "fpln"
     results = []
-    text = await fetch_url("https://openproxy.space/api/proxies/HTTP", timeout=15)
-    if not text:
-        return results
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return results
-
-    raw_list = data.get("data", {}).get("HTTP", [])
+    urls = [
+        "https://free-proxy-list.net/",
+        "https://www.us-proxy.org/",
+        "https://www.sslproxies.org/",
+    ]
     seen = set()
-    for entry in raw_list:
-        parts = entry.split(":")
-        if len(parts) != 2:
+    for url in urls:
+        text = await fetch_url(url, timeout=15)
+        if not text:
             continue
-        ip, port_str = parts
-        try:
+        ips = re.findall(
+            r'<td>(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})</td>\s*<td>(\d+)</td>',
+            text,
+        )
+        for ip, port_str in ips:
             port = int(port_str)
-        except ValueError:
-            continue
-        key = (ip, port)
-        if key not in seen and not _blocked_ip(ip):
-            seen.add(key)
-            results.append((ip, port, source))
-
+            key = (ip, port)
+            if key not in seen and not _blocked_ip(ip):
+                seen.add(key)
+                results.append((ip, port, source))
     return results
 
 
@@ -289,9 +411,9 @@ async def scrape_lists() -> list[tuple[str, int, str]]:
                 seen.add(key)
                 proxies.append(item)
 
-    if not should_skip_source("openproxy"):
-        op = await scrape_openproxy()
-        for item in op:
+    if not should_skip_source("fpln"):
+        fpl = await scrape_fpln()
+        for item in fpl:
             key = (item[0], item[1])
             if key not in seen:
                 seen.add(key)
