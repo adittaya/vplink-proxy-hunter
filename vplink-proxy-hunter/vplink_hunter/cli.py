@@ -225,10 +225,13 @@ async def main_loop(args):
         proxies = await scrape_lists()
         if proxies:
             seen: set[tuple[str, int]] = set()
-            for ip, port in proxies:
+            for item in proxies:
+                ip, port = item[0], item[1]
+                source = item[2] if len(item) >= 3 else "unknown"
                 ip_port = (ip, port)
                 if ip_port not in seen and not _ip_in_dc_cidr(ip):
                     seen.add(ip_port)
+                    source_for_ip[ip_port] = source
                     try:
                         q.put_nowait(ip_port)
                         stats["generated"] += 1
